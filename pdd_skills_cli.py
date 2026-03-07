@@ -1,0 +1,125 @@
+#!/usr/bin/env python3
+"""
+PDDAgent 命令行入口：调用拼多多定制能力（open、search、dump-products、dump-store-page、parse-store-xml）。
+依赖见 requirements.txt（mobile_agent、uiautomator_android）。
+"""
+import argparse
+import json
+import sys
+from pathlib import Path
+from typing import Any
+
+# 确保仓库根在 path 中
+_repo = Path(__file__).resolve().parent.parent
+if str(_repo) not in sys.path:
+    sys.path.insert(0, str(_repo))
+
+from pdd_skills import (
+    dump_product_detail,
+    dump_products,
+    dump_store_page,
+    ensure_search_page,
+    get_product_click_targets,
+    open_app,
+    parse_store_page_xml,
+    search,
+)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="pdd_skills 命令行（PDDAgent）")
+    parser.add_argument("--json", action="store_true", help="输出 JSON")
+    parser.add_argument("--device", "-d", default=None, help="设备：Android 序列号或 IP:port，省略则自动检测")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    sub.add_parser("open", help="打开拼多多").add_argument("--stop", action="store_true", help="先结束再启动")
+    sub.add_parser("ensure-search-page", help="打开拼多多并进入搜索页（若不在则点击进入）")
+    p_search = sub.add_parser("search", help="在应用内搜索")
+    p_search.add_argument("keyword", help="搜索关键词")
+    p_search.add_argument("--search-button", default="搜索", dest="search_button", help="搜索按钮文案")
+    p_dump_p = sub.add_parser("dump-products", help="从当前页解析商品列表")
+    p_dump_p.add_argument("--limit", type=int, default=10, help="最多解析条数")
+    p_dump_detail = sub.add_parser("dump-product-detail", help="从当前商品详情页解析商品+店铺（进店按钮）")
+    p_dump_detail.add_argument("--max-scrolls", type=int, default=5, help="详情页下滑最多次数以找进店")
+    p_store = sub.add_parser("dump-store-page", help="dump 店铺：无参则仅解析当前页；有 store 则完整流程并可选 CSV")
+    p_store.add_argument("store", nargs="?", default=None, help="店铺关键词（可选；无则仅解析当前页）")
+    p_store.add_argument("--output-csv", dest="output_csv", default=None, help="完整流程时写入 CSV 路径")
+    p_store.add_argument("--max-products", type=int, default=20, dest="max_products", help="最多点击多少个商品找进店")
+    p_store.add_argument("--no-new-limit", type=int, default=5, dest="no_new_limit", help="店内滑到底：连续几次无新内容则停")
+    p_click = sub.add_parser("get-product-click-targets", help="从当前页解析可点击商品位置（用于进详情）")
+    p_click.add_argument("--limit", type=int, default=20, help="最多返回条数")
+    p_parse = sub.add_parser("parse-store-xml", help="解析本地店铺首页 XML（无需设备）")
+    p_parse.add_argument("file", help="store.xml 文件路径")
+
+    args = parser.parse_args()
+    use_json = args.json
+
+    def out(obj: Any) -> None:
+        if use_json:
+            print(json.dumps(obj, ensure_ascii=False, indent=2))
+        else:
+            if isinstance(obj, dict) and "ok" in obj:
+                if not obj.get("ok"):
+                    print("error:", obj.get("error"), obj.get("detail", ""), file=sys.stderr)
+                    return
+                obj = obj.get("result")
+            if obj is not None:
+                print(json.dumps(obj, ensure_ascii=False, indent=2))
+            else:
+                print("ok")
+
+    try:
+        need_device = args.command in (
+            "open", "ensure-search-page", "search", "dump-products", "dump-product-detail",
+            "dump-store-page", "get-product-click-targets",
+        )
+        if need_device:
+            from mobile_agent import init as mobile_init
+            mobile_init(device=args.device)
+        if args.command == "open":
+            out(open_app(stop=getattr(args, "stop", False)))
+        elif args.command == "ensure-search-page":
+            out(ensure_search_page())
+        elif args.command == "search":
+            page_out = ensure_search_page()
+            if not page_out.get("ok"):
+                out(page_out)
+                if "parsed" in page_out:
+                    print("[pdd_store] parsed:", json.dumps(page_out["parsed"], ensure_ascii=False, indent=2, default=str), flush=True)
+                return 1
+            page_el = page_out.get("result") or {}
+            out(search(
+                args.keyword,
+                search_button_text=args.search_button,
+                search_input=page_el.get("search_input"),
+                search_button=page_el.get("search_button"),
+            ))
+        elif args.command == "dump-products":
+            out(dump_products(limit=args.limit))
+        elif args.command == "dump-product-detail":
+            out(dump_product_detail(max_scrolls=getattr(args, "max_scrolls", 5)))
+        elif args.command == "dump-store-page":
+            store_kw = getattr(args, "store", None)
+            out(dump_store_page(
+                store_keyword=store_kw,
+                max_products_to_try=getattr(args, "max_products", 20),
+                store_scroll_no_new_limit=getattr(args, "no_new_limit", 5),
+                output_csv=getattr(args, "output_csv", None),
+            ))
+        elif args.command == "get-product-click-targets":
+            out(get_product_click_targets(limit=getattr(args, "limit", 20)))
+        elif args.command == "parse-store-xml":
+            xml_str = Path(args.file).read_text(encoding="utf-8")
+            out(parse_store_page_xml(xml_str))
+    except Exception as e:
+        err = {"ok": False, "error": type(e).__name__, "detail": str(e)}
+        if use_json:
+            print(json.dumps(err, ensure_ascii=False, indent=2))
+        else:
+            print("error:", e, file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

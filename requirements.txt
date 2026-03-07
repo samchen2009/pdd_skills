@@ -1,0 +1,5 @@
+# pdd_skills 依赖（PDDAgent 层）
+# 在仓库根下执行：pip install -e ./mobile_agent -e ./uiautomator_android
+# 或从本目录：pip install -r requirements.txt（依赖 ../mobile_agent ../uiautomator_android）
+-e ../mobile_agent
+-e ../uiautomator_android
