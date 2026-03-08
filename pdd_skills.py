@@ -172,7 +172,7 @@ def select_search_tab(store: bool = True) -> dict:
     if not u.last_result.get("ok"):
         _log(f"select_search_tab: 未找到 {open_tab!r}")
         return u.last_result
-    time.sleep(0.5)
+    time.sleep(0.3)
     # 第二步：点目标「店铺」或「商品」
     _log(f"select_search_tab: 点选项 {target_tab!r}...")
     u.click(text=target_tab)
@@ -181,7 +181,7 @@ def select_search_tab(store: bool = True) -> dict:
     if not u.last_result.get("ok"):
         _log(f"select_search_tab: 未找到选项 {target_tab!r}")
         return u.last_result
-    time.sleep(0.8)
+    time.sleep(0.5)
     _log(f"select_search_tab: 已选 {target_tab!r}")
     return {"ok": True}
 
@@ -265,14 +265,14 @@ def search_store(store_name: str) -> dict:
     tab_out = select_store_search_tab()
     if not tab_out.get("ok"):
         return tab_out
-    time.sleep(0.5)
+    time.sleep(0.3)
     # 输入关键词并点击搜索
     search(
         store_name.strip(),
         search_input=page_el.get("search_input"),
         search_button=page_el.get("search_button"),
     )
-    time.sleep(2.5)
+    time.sleep(1.5)
     u = _u()
     u.dump()
     out = u.last_result
@@ -293,7 +293,7 @@ def search_store(store_name: str) -> dict:
             cx, cy = item.get("enter_center") or item.get("center") or (0, 0)
             _log(f"search_store: 点击目标店铺「进店」 {name!r} at ({cx},{cy})")
             u.click(x=cx, y=cy)
-            time.sleep(2)
+            time.sleep(1.2)
             return {"ok": True, "result": {"store_name": name}}
     _log("search_store: 未找到目标店铺，尝试下滑再找")
     win = u.window_size()
@@ -301,7 +301,7 @@ def search_store(store_name: str) -> dict:
     h = (win.get("result") or {}).get("height") or 960
     for _ in range(5):
         u.swipe(w // 2, int(h * 0.7), w // 2, int(h * 0.3), duration=0.25)
-        time.sleep(1.2)
+        time.sleep(0.8)
         u.dump()
         out = u.last_result
         if not out.get("ok"):
@@ -314,7 +314,7 @@ def search_store(store_name: str) -> dict:
                 cx, cy = item.get("enter_center") or item.get("center") or (0, 0)
                 _log(f"search_store: 下滑后点击目标店铺「进店」 {name!r}")
                 u.click(x=cx, y=cy)
-                time.sleep(2)
+                time.sleep(1.2)
                 return {"ok": True, "result": {"store_name": name}}
     return {
         "ok": False,
@@ -636,7 +636,7 @@ def dump_product_detail(max_scrolls: int = 5) -> dict:
         if i < max_scrolls - 1:
             _log("dump_product_detail: 下滑...")
             u.swipe(fx, fy, tx, ty, duration=0.2)
-            time.sleep(0.8)
+            time.sleep(0.5)
     _log("dump_product_detail: 达到最大下滑次数，返回最后解析结果")
     return {"ok": True, "result": last_parsed}
 
@@ -714,7 +714,7 @@ def scroll_store_to_end(
         # 下滑
         _log("scroll_store_to_end: 下滑...")
         u.swipe(fx, fy, tx, ty, duration=0.2)
-        time.sleep(1.0)
+        time.sleep(0.6)
 
         # 停止条件 1：连续 no_new_limit 次滑不动（滑动后屏内容与滑动前相同）
         u.dump()
@@ -775,8 +775,27 @@ def _out_of_stock_flag(tags: List[str]) -> str:
     return "Y" if any(kw in joined for kw in OUT_OF_STOCK_KEYWORDS) else ""
 
 
+_ONLY_LEFT_RE = re.compile(r"仅剩\s*(\d+)\s*件")
+
+
+def _extract_only_left(product: Dict[str, Any]) -> str:
+    """从商品信息中提取「仅剩X件」中的数字，未出现则返回空字符串。"""
+    texts: List[str] = []
+    for key in ("tags", "title", "title_short", "sales"):
+        v = product.get(key)
+        if isinstance(v, list):
+            texts.extend(str(x) for x in v)
+        elif v:
+            texts.append(str(v).strip())
+    for s in texts:
+        m = _ONLY_LEFT_RE.search(s)
+        if m:
+            return m.group(1)
+    return ""
+
+
 def to_csv_rows(store: Dict[str, Any], products: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """将店铺 + 商品列表转为可写 CSV 的扁平行列表。每行包含店铺字段 + 单商品字段 + 缺货标志。"""
+    """将店铺 + 商品列表转为可写 CSV 的扁平行列表。每行包含店铺字段 + 单商品字段 + 缺货标志 + 仅剩。"""
     rows: List[Dict[str, Any]] = []
     store_name = (store.get("store_name") or "").strip()
     total_sales = (store.get("total_sales") or "").strip()
@@ -793,6 +812,7 @@ def to_csv_rows(store: Dict[str, Any], products: List[Dict[str, Any]]) -> List[D
             "sales": p.get("sales"),
             "tags": tags_str,
             "缺货标志": _out_of_stock_flag(tag_list),
+            "仅剩": _extract_only_left(p),
         })
     return rows
 
@@ -1105,8 +1125,8 @@ def dump_store_page(
     if not search_out.get("ok"):
         _log(f"dump_store_page: search_store 失败 {search_out}")
         return search_out
-    _log("dump_store_page: 已进入目标店铺，等待 2s 后 scroll_store_to_end...")
-    time.sleep(2)
+    _log("dump_store_page: 已进入目标店铺，等待 1.2s 后 scroll_store_to_end...")
+    time.sleep(1.2)
     scroll_out = scroll_store_to_end(no_new_limit=store_scroll_no_new_limit, end_marker=end_marker)
     if not scroll_out.get("ok"):
         _log(f"dump_store_page: scroll_store_to_end 失败: {scroll_out}")
@@ -1125,6 +1145,68 @@ def dump_store_page(
             "store": store,
             "products": products,
             "rows": rows,
+        },
+    }
+
+
+def dump_stores_to_csv(
+    store_keywords: List[str],
+    output_csv: str,
+    *,
+    max_products_to_try: int = 20,
+    store_scroll_no_new_limit: int = 5,
+    end_marker: str = STORE_END_MARKER,
+) -> dict:
+    """
+    依次对多个店铺执行 dump_store_page，将各店 rows 合并后写入一个 CSV。
+    单店失败时跳过并记录，不中断后续店铺；汇总 CSV 仅含成功店铺数据。
+    返回 {"ok": True, "result": {"success_stores", "failed_stores", "total_rows", "output_csv"}}；
+    若全部失败则 ok 仍为 True，total_rows=0，不写或写空 CSV。
+    """
+    all_rows: List[Dict[str, Any]] = []
+    success_stores: List[str] = []
+    failed_stores: List[Dict[str, Any]] = []  # [{"store": kw, "error": ..., "detail": ...}, ...]
+    for i, kw in enumerate(store_keywords):
+        kw = (kw or "").strip()
+        if not kw:
+            continue
+        # 从第二家店铺起：先重启 app 回到首页，再搜下一家，否则当前仍在上一家店铺内无法进入搜索
+        if i > 0:
+            _log("dump_stores_to_csv: 返回首页以搜索下一店铺（重启拼多多）...")
+            open_app(stop=True)
+            time.sleep(1.2)
+        _log(f"dump_stores_to_csv: 处理店铺 {kw!r} ({len(success_stores) + len(failed_stores) + 1}/{len(store_keywords)})")
+        out = dump_store_page(
+            store_keyword=kw,
+            max_products_to_try=max_products_to_try,
+            store_scroll_no_new_limit=store_scroll_no_new_limit,
+            end_marker=end_marker,
+            output_csv=None,
+        )
+        if out.get("ok"):
+            rows = (out.get("result") or {}).get("rows") or []
+            all_rows.extend(rows)
+            success_stores.append(kw)
+            _log(f"dump_stores_to_csv: 店铺 {kw!r} 成功，rows={len(rows)}，累计 {len(all_rows)} 行")
+        else:
+            failed_stores.append({
+                "store": kw,
+                "error": out.get("error", "unknown"),
+                "detail": out.get("detail", ""),
+            })
+            _log(f"dump_stores_to_csv: 店铺 {kw!r} 失败，跳过: {out.get('error')} {out.get('detail', '')}")
+    if all_rows:
+        _log(f"dump_stores_to_csv: 写入汇总 CSV {output_csv}，共 {len(all_rows)} 行")
+        write_store_csv(all_rows, output_csv)
+    else:
+        _log("dump_stores_to_csv: 无成功店铺数据，不写入 CSV")
+    return {
+        "ok": True,
+        "result": {
+            "success_stores": success_stores,
+            "failed_stores": failed_stores,
+            "total_rows": len(all_rows),
+            "output_csv": output_csv if all_rows else None,
         },
     }
 
@@ -1172,14 +1254,14 @@ def dump_store_page_by_product(
     page_el = page_out.get("result") or {}
     _log("dump_store_page_by_product: 切换到「商品」搜索")
     select_search_tab(store=False)
-    time.sleep(0.5)
+    time.sleep(0.3)
     _log("dump_store_page_by_product: 步骤 2 搜索 store_keyword（商品列表）")
     search(
         store_keyword.strip(),
         search_input=page_el.get("search_input"),
         search_button=page_el.get("search_button"),
     )
-    time.sleep(2)
+    time.sleep(1.2)
     u = _u()
     _log("dump_store_page: 步骤 3 获取商品可点击列表（可下滑多屏凑满最多 {} 个）".format(max_products_to_try))
     seen_centers: Set[Tuple[int, int]] = set()
@@ -1214,7 +1296,7 @@ def dump_store_page_by_product(
             break
         if scroll_round < max_scrolls - 1:
             u.swipe(fx, fy, tx, ty, duration=0.25)
-            time.sleep(1.5)
+            time.sleep(1.0)
     targets = targets[:max_products_to_try]
     _log(f"dump_store_page: 共 {len(targets)} 个商品，依次点击找进店（最多 {max_products_to_try}）")
     entered = False
@@ -1222,13 +1304,13 @@ def dump_store_page_by_product(
         _log(f"dump_store_page: 商品 {idx+1}/{len(targets)} 点击 ({t.get('title', '')[:20]}...)")
         cx, cy = t.get("center") or (0, 0)
         u.click(x=cx, y=cy)
-        time.sleep(2)
+        time.sleep(1.2)
         _log(f"dump_store_page: 商品 {idx+1} 进入详情页，dump_product_detail...")
         detail_out = dump_product_detail(max_scrolls=max_detail_scrolls)
         if not detail_out.get("ok"):
             _log(f"dump_store_page: 商品 {idx+1} dump_product_detail 失败，返回列表")
             u.press("back")
-            time.sleep(1)
+            time.sleep(0.8)
             continue
         detail = detail_out.get("result") or {}
         store_block = detail.get("store") or {}
@@ -1243,7 +1325,7 @@ def dump_store_page_by_product(
                 break
         _log(f"dump_store_page: 非目标店铺，返回列表")
         u.press("back")
-        time.sleep(1)
+        time.sleep(0.8)
     if not entered:
         _log("dump_store_page: 未找到目标店铺，退出")
         return {
@@ -1251,8 +1333,8 @@ def dump_store_page_by_product(
             "error": "store_not_found",
             "detail": f"在 {max_products_to_try} 个商品详情页未找到目标店铺「{store_keyword}」",
         }
-    _log("dump_store_page: 步骤 4 进店完成，等待 2s 后 scroll_store_to_end...")
-    time.sleep(2)
+    _log("dump_store_page: 步骤 4 进店完成，等待 1.2s 后 scroll_store_to_end...")
+    time.sleep(1.2)
     scroll_out = scroll_store_to_end(no_new_limit=store_scroll_no_new_limit, end_marker=end_marker)
     if not scroll_out.get("ok"):
         _log(f"dump_store_page: scroll_store_to_end 失败: {scroll_out}")
