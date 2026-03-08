@@ -139,13 +139,9 @@ def ensure_search_page() -> dict:
     使用 mobile_agent 通用 ensure_search_page；拼多多无特殊结构时不必覆盖。
     返回 {"ok": True, "result": {"search_input": {...}, "search_button": {...}}} 或错误 dict。
     """
-    _log("ensure_search_page: 调用通用 ensure_search_page (dump 解析)...")
     from mobile_agent import ensure_search_page as ma_ensure_search_page
     out = ma_ensure_search_page(app=PDD_PACKAGE, package=PDD_PACKAGE)
     r = out.get("result") or out.get("parsed") or {}
-    _log(f"ensure_search_page: search_input={bool(r.get('search_input'))} search_button={bool(r.get('search_button'))} search_entry={bool(r.get('search_entry'))}")
-    if r:
-        _log("ensure_search_page: parsed detail: " + json.dumps(r, ensure_ascii=False, indent=2, default=str))
     return out
 
 
@@ -154,36 +150,103 @@ STORE_TAB_TEXT = "店铺"
 PRODUCT_TAB_TEXT = "商品"
 
 
+def _find_tab_center_in_xml(xml_str: str, tab_text: str, package: str = PDD_PACKAGE) -> Optional[Tuple[int, int]]:
+    """
+    在 hierarchy XML 中查找 text 或 content-desc 为 tab_text 的节点，
+    优先取可点击的父节点（下拉触发器多为父 ViewGroup），返回 bounds 中心 (cx, cy)。
+    """
+    try:
+        root = ET.fromstring(xml_str)
+    except ET.ParseError:
+        return None
+    want = (tab_text or "").strip()
+    if not want:
+        return None
+    # 先找所有 text 或 content-desc 匹配的节点
+    candidates: List[ET.Element] = []
+    for n in root.iter():
+        if (n.get("package") or "").strip() != package:
+            continue
+        t = (n.get("text") or "").strip()
+        d = (n.get("content-desc") or "").strip()
+        if t != want and d != want:
+            continue
+        b = _parse_bounds(n.get("bounds") or "")
+        if b and len(b) >= 4:
+            candidates.append(n)
+    if not candidates:
+        return None
+    # 优先选可点击的节点（或可点击的父节点）
+    for n in candidates:
+        clickable = (n.get("clickable") or "").strip() == "true"
+        if clickable:
+            b = _parse_bounds(n.get("bounds") or "")
+            if b and len(b) >= 4:
+                return ((b[0] + b[2]) // 2, (b[1] + b[3]) // 2)
+    # 否则找其可点击的祖先（搜索页上「商品」在 ViewGroup 内，父 ViewGroup 可点击）
+    for n in candidates:
+        node = n
+        for _ in range(10):
+            parent = None
+            for p in root.iter():
+                if node in list(p):
+                    parent = p
+                    break
+            if parent is None:
+                break
+            node = parent
+            if (node.get("clickable") or "").strip() == "true":
+                b = _parse_bounds(node.get("bounds") or "")
+                if b and len(b) >= 4:
+                    return ((b[0] + b[2]) // 2, (b[1] + b[3]) // 2)
+    # 回退：用第一个候选的 bounds 中心
+    b = _parse_bounds(candidates[0].get("bounds") or "")
+    if b and len(b) >= 4:
+        return ((b[0] + b[2]) // 2, (b[1] + b[3]) // 2)
+    return None
+
+
 def select_search_tab(store: bool = True) -> dict:
     """
     当前页为搜索中间页时，先点当前 tab 弹出下拉，再点目标选项：
     - 目标为店铺(store=True)：点击「商品」→ 出现下拉 → 点击「店铺」；
     - 目标为商品(store=False)：点击「店铺」→ 出现下拉 → 点击「商品」。
+    使用 dump + XML 解析坐标再 click(x,y)，避免 u.click(text=...) 长时间阻塞。
     返回 {"ok": True} 或错误 dict。
     """
     u = _u()
-    # 第一步：点「商品」或「店铺」打开下拉（与目标相反，点当前显示的才能弹出）
     open_tab = PRODUCT_TAB_TEXT if store else STORE_TAB_TEXT
     target_tab = STORE_TAB_TEXT if store else PRODUCT_TAB_TEXT
     _log(f"select_search_tab: 目标={'店铺' if store else '商品'}，先点 {open_tab!r} 弹出下拉...")
-    u.click(text=open_tab)
-    if not u.last_result.get("ok"):
-        u.click(description=open_tab)
-    if not u.last_result.get("ok"):
+    u.dump()
+    out = u.last_result
+    if not out.get("ok"):
+        _log(f"select_search_tab: dump 失败")
+        return out
+    xml_str = (out.get("result") or {}).get("xml") or ""
+    cen = _find_tab_center_in_xml(xml_str, open_tab)
+    if not cen:
         _log(f"select_search_tab: 未找到 {open_tab!r}")
-        return u.last_result
-    time.sleep(0.3)
-    # 第二步：点目标「店铺」或「商品」
+        return {"ok": False, "error": "tab_not_found", "detail": f"未找到 {open_tab!r}"}
+    u.click(x=cen[0], y=cen[1])
+    time.sleep(0.7)
+    # 第二步：点目标「店铺」或「商品」（下拉出现后可能需再 dump）
     _log(f"select_search_tab: 点选项 {target_tab!r}...")
-    u.click(text=target_tab)
-    if not u.last_result.get("ok"):
-        u.click(description=target_tab)
-    if not u.last_result.get("ok"):
-        _log(f"select_search_tab: 未找到选项 {target_tab!r}")
-        return u.last_result
-    time.sleep(0.5)
-    _log(f"select_search_tab: 已选 {target_tab!r}")
-    return {"ok": True}
+    for attempt in range(3):
+        u.dump()
+        out = u.last_result
+        if not out.get("ok"):
+            break
+        xml_str = (out.get("result") or {}).get("xml") or ""
+        cen2 = _find_tab_center_in_xml(xml_str, target_tab)
+        if cen2:
+            u.click(x=cen2[0], y=cen2[1])
+            time.sleep(0.6)
+            _log(f"select_search_tab: 已选 {target_tab!r}")
+            return {"ok": True}
+        time.sleep(0.5)
+    _log(f"select_search_tab: 未找到选项 {target_tab!r}")
+    return {"ok": False, "error": "target_tab_not_found", "detail": f"下拉后未找到 {target_tab!r}"}
 
 
 def select_store_search_tab() -> dict:
@@ -265,7 +328,7 @@ def search_store(store_name: str) -> dict:
     tab_out = select_store_search_tab()
     if not tab_out.get("ok"):
         return tab_out
-    time.sleep(0.3)
+    time.sleep(0.5)
     # 输入关键词并点击搜索
     search(
         store_name.strip(),
@@ -300,8 +363,8 @@ def search_store(store_name: str) -> dict:
     w = (win.get("result") or {}).get("width") or 540
     h = (win.get("result") or {}).get("height") or 960
     for _ in range(5):
-        u.swipe(w // 2, int(h * 0.7), w // 2, int(h * 0.3), duration=0.25)
-        time.sleep(0.8)
+        u.swipe(w // 2, int(h * 0.7), w // 2, int(h * 0.3), duration=0.3)
+        time.sleep(0.9)
         u.dump()
         out = u.last_result
         if not out.get("ok"):
@@ -635,8 +698,8 @@ def dump_product_detail(max_scrolls: int = 5) -> dict:
             return {"ok": True, "result": parsed}
         if i < max_scrolls - 1:
             _log("dump_product_detail: 下滑...")
-            u.swipe(fx, fy, tx, ty, duration=0.2)
-            time.sleep(0.5)
+            u.swipe(fx, fy, tx, ty, duration=0.25)
+            time.sleep(1)
     _log("dump_product_detail: 达到最大下滑次数，返回最后解析结果")
     return {"ok": True, "result": last_parsed}
 
@@ -666,12 +729,16 @@ def _xml_has_end_marker_in_bottom(xml_str: str, end_marker: str, screen_h: int) 
 def scroll_store_to_end(
     no_new_limit: int = 5,
     end_marker: str = STORE_END_MARKER,
+    no_dedup: bool = False,
+    max_cart_scrolls: int = 2,
+    max_products_scrolls: Optional[int] = None,
 ) -> dict:
     """
-    当前页为店铺首页时：不停下滑直到满足任一停止条件：
-    1. 连续 no_new_limit 次滑不动（滑动前后屏内容相同，说明到底了）
-    2. 底部出现结束提示词 end_marker
-    返回合并后的 {store, products} 及 parsed_list。
+    当前页为店铺首页时，逐屏下滑并合并（只合入有价商品，按 title+价格 去重）：
+    parsed_list 存放每屏新商品批次，parsed_in_last_screen 为上一屏新商品，parsed_in_current_screen 为当前屏有价商品。
+    while: dump -> tmp = merge_products(last, current) -> parsed_list.append(tmp) -> parsed_in_last_screen = tmp -> 退出判断 -> 下滑。
+    停止条件：底部 end_marker、连续 no_new_limit 次本屏新增为 0、或达到 max_products_scrolls。
+    返回 {"merged": {store, products}, "parsed_list": [batch1, batch2, ...]}。
     """
     _log("scroll_store_to_end: 开始...")
     u = _u()
@@ -683,9 +750,14 @@ def scroll_store_to_end(
     h = (win.get("result") or {}).get("height") or 960
     fx, fy = w // 2, int(h * 0.75)
     tx, ty = w // 2, int(h * 0.25)
-    parsed_list: List[Dict[str, Any]] = []
+    _log(f"scroll_store_to_end: 屏幕 {w}x{h}, 下滑坐标 from=({fx},{fy}) to=({tx},{ty}), no_new_limit={no_new_limit}, max_products_scrolls={max_products_scrolls}")
+    # parsed_list: 存放每屏 merge 结果（每项是一批新商品）；parsed_in_last_screen: 上一屏新商品，初始为空
+    parsed_list: List[List[Dict[str, Any]]] = []
+    parsed_in_last_screen: List[Dict[str, Any]] = []
     no_slide_count = 0
     round_no = 0
+    scroll_count = 0
+    store: Dict[str, Any] = {}
     while True:
         round_no += 1
         _log(f"scroll_store_to_end: 第 {round_no} 轮 dump...")
@@ -696,38 +768,29 @@ def scroll_store_to_end(
             return out
         xml_str = (out.get("result") or {}).get("xml") or ""
         parsed = parse_store_page_xml(xml_str)
-        parsed_list.append(parsed)
-        products_this = parsed.get("products") or []
-        cur_count = len(products_this)
-        first_title = (products_this[0].get("title") or products_this[0].get("title_short") or "").strip() if products_this else ""
+        if not store and (parsed.get("store") or {}):
+            store = parsed.get("store") or {}
+        parsed_in_current_screen = parsed.get("products") or []
 
-        # 停止条件 2：底部出现结束提示词
         if _xml_has_end_marker_in_bottom(xml_str, end_marker, h):
             _log(f"scroll_store_to_end: 底部出现结束文案 {end_marker!r}，停止")
             break
 
-        merged = merge_store_parsed_list(parsed_list)
-        total_now = len(merged.get("products") or [])
+        tmp = merge_products(parsed_in_last_screen, parsed_in_current_screen)
+        if tmp:
+            _enrich_cart_remark_for_products(u, tmp, w, h, max_cart_scrolls=max_cart_scrolls)
+        parsed_list.append(tmp)
+        for j, p in enumerate(tmp):
+            tit = (p.get("title_short") or p.get("title") or "").strip()[:40]
+            pr = p.get("price")
+            _log(f"scroll_store_to_end:   [{j}] {tit!r} price={pr!r}")
+        parsed_in_last_screen = tmp
 
-        _log(f"scroll_store_to_end: 本屏商品数={cur_count}, 合并总数={total_now}, 连续滑不动={no_slide_count}/{no_new_limit}")
-
-        # 下滑
-        _log("scroll_store_to_end: 下滑...")
-        u.swipe(fx, fy, tx, ty, duration=0.2)
-        time.sleep(0.6)
-
-        # 停止条件 1：连续 no_new_limit 次滑不动（滑动后屏内容与滑动前相同）
-        u.dump()
-        out2 = u.last_result
-        if not out2.get("ok"):
-            break
-        xml_str2 = (out2.get("result") or {}).get("xml") or ""
-        parsed2 = parse_store_page_xml(xml_str2)
-        parsed_list.append(parsed2)
-        cur_count2 = len(parsed2.get("products") or [])
-        products2 = parsed2.get("products") or []
-        first_title2 = (products2[0].get("title") or products2[0].get("title_short") or "").strip() if products2 else ""
-        if cur_count2 == cur_count and first_title2 == first_title and cur_count > 0:
+        total_now = sum(len(batch) for batch in parsed_list)
+        """
+        _log(f"scroll_store_to_end: 本屏有价={len([p for p in parsed_in_current_screen if _normalize_price_for_key(p.get('price'))])}，本屏新增={len(tmp)}，累计 {total_now} 条，连续无新增={no_slide_count}/{no_new_limit}")
+        """
+        if len(tmp) == 0:
             no_slide_count += 1
         else:
             no_slide_count = 0
@@ -735,32 +798,119 @@ def scroll_store_to_end(
             _log("scroll_store_to_end: 连续滑不动达到上限，停止")
             break
 
-    merged = merge_store_parsed_list(parsed_list)
-    _log(f"scroll_store_to_end: 共 {len(parsed_list)} 屏，合并商品数={len(merged.get('products') or [])}，完成")
+        scroll_count += 1
+        if max_products_scrolls is not None and scroll_count >= max_products_scrolls:
+            _log(f"scroll_store_to_end: 店内下滑次数已达 {max_products_scrolls}，停止")
+            break
+
+        u.swipe(fx, fy, tx, ty, duration=0.25)
+        """
+            must sleep enough time to let the screen freeze
+            otherwise, click(x,y) will fail
+        """
+        time.sleep(2)
+
+    merged_products: List[Dict[str, Any]] = []
+    for batch in parsed_list:
+        merged_products.extend(batch)
+    merged = {"store": store, "products": merged_products}
+    _log(f"scroll_store_to_end: 共 {len(parsed_list)} 屏，合并商品数={len(merged_products)}，完成")
     return {"ok": True, "result": {"merged": merged, "parsed_list": parsed_list}}
 
 
 def merge_store_parsed_list(parsed_list: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """合并多次 parse_store_page_xml 的结果：店铺取首个非空，商品按 title+price 去重（同标题同价视为同一商品）。"""
     store: Dict[str, Any] = {}
     products: List[Dict[str, Any]] = []
     seen_keys: Set[str] = set()
+    key_to_index: Dict[str, int] = {}
     for p in parsed_list:
         s = p.get("store") or {}
         if s and not store:
             store = s
         for prod in p.get("products") or []:
-            title = (prod.get("title") or prod.get("title_short") or "").strip()
-            price = prod.get("price") or ""
-            key = (title or "") + "|" + str(price)
+            key = _product_seen_key(prod)
             if key not in seen_keys:
                 seen_keys.add(key)
+                key_to_index[key] = len(products)
                 products.append(prod)
             else:
-                """
-                _log(f"merge_store: 去重跳过 标题={title[:40]}{'...' if len(title) > 40 else ''!r} 价格={price!r} key={key[:60]}{'...' if len(key) > 60 else ''!r}")
-                """
+                remark = (prod.get("备注") or "").strip()
+                if remark:
+                    idx = key_to_index.get(key)
+                    if idx is not None and not (products[idx].get("备注") or "").strip():
+                        products[idx]["备注"] = remark
     return {"store": store, "products": products}
+
+
+def merge_store_parsed_list_keep_all(parsed_list: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """不去重：按出现顺序保留所有商品；同一 xml_node_id 只保留一条并合并备注（同屏重复卡只记一次）。"""
+    store: Dict[str, Any] = {}
+    products: List[Dict[str, Any]] = []
+    seen_id_to_idx: Dict[str, int] = {}
+    for p in parsed_list:
+        s = p.get("store") or {}
+        if s and not store:
+            store = s
+        for prod in p.get("products") or []:
+            nid = (prod.get("xml_node_id") or "").strip()
+            if nid and nid in seen_id_to_idx:
+                idx = seen_id_to_idx[nid]
+                remark = (prod.get("备注") or "").strip()
+                if remark and not (products[idx].get("备注") or "").strip():
+                    products[idx]["备注"] = remark
+                continue
+            if nid:
+                seen_id_to_idx[nid] = len(products)
+            products.append(prod)
+    return {"store": store, "products": products}
+
+
+def merge_products(
+    parsed_in_last_screen: List[Dict[str, Any]],
+    parsed_in_current_screen: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """
+    按 title+价格 去重：返回「当前屏有价商品」中不在「上一屏新商品」里的列表（B - A）。
+    只合入有价格的商品；同一商品以 _same_product_by_name_price 判定。
+    """
+    current_with_price = [
+        p for p in parsed_in_current_screen
+        if _normalize_price_for_key(p.get("price"))
+    ]
+    return [
+        p for p in current_with_price
+        if not any(_same_product_by_name_price(p, q) for q in parsed_in_last_screen)
+    ]
+
+
+def merge_store_parsed_list_by_name_price(parsed_list: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    总表 T。A = 上一屏新出现的商品（滑动前），B = 当前屏所有有价商品（滑动后）。
+    第一屏：A = 本屏有价列表，A => T，A = A（本屏即「新出现」）；
+    第二屏起：B - A => T（滑动后新出现的合入总表），A = B - A（下一屏用）。
+    同一商品以 name+价格 判定（支持名字前缀一致）。
+    """
+    store: Dict[str, Any] = {}
+    T: List[Dict[str, Any]] = []
+    A: List[Dict[str, Any]] = []
+    for i in range(len(parsed_list)):
+        s = (parsed_list[i].get("store") or {}) if parsed_list[i] else {}
+        if s and not store:
+            store = s
+        B = [p for p in (parsed_list[i].get("products") or []) if _normalize_price_for_key(p.get("price"))]
+        if i == 0:
+            T.extend(B)
+            A = B
+            _log(f"合并: 第1屏 有价商品数={len(B)} => T，累计 {len(T)} 条")
+        else:
+            new_list = [p for p in B if not any(_same_product_by_name_price(p, q) for q in A)]
+            _log(f"合并: 第{i+1}屏 B有价={len(B)}，B-A={len(new_list)} => T，累计 {len(T) + len(new_list)} 条")
+            for p in new_list:
+                tit = (p.get("title_short") or p.get("title") or "").strip()[:30]
+                _log(f"合并:   比较 => 新增 屏{i+1} 商品 {tit!r} price={p.get('price')!r}")
+            T.extend(new_list)
+            A = new_list
+    return {"store": store, "products": T}
 
 
 # tags 中出现以下任一关键词则标记为缺货
@@ -794,6 +944,553 @@ def _extract_only_left(product: Dict[str, Any]) -> str:
     return ""
 
 
+def _should_open_cart_for_remark(product: Dict[str, Any]) -> bool:
+    """是否需要点开购物车取备注：商品带「仅剩X件」或「即将售罄」时返回 True。"""
+    if _extract_only_left(product):
+        return True
+    texts: List[str] = []
+    for key in ("tags", "title", "title_short", "sales"):
+        v = product.get(key)
+        if isinstance(v, list):
+            texts.extend(str(x) for x in v)
+        elif v:
+            texts.append(str(v).strip())
+    joined = "|".join(texts)
+    return "即将售罄" in joined
+
+
+def _find_card_for_product(root: ET.Element, product: Dict[str, Any], package: str = PDD_PACKAGE) -> Optional[ET.Element]:
+    """
+    在店铺首页 dump 的 root 中，根据商品 title/title_short 找到对应商品卡 ViewGroup。
+    用于后续在该卡内找右下角「+」按钮。
+    """
+    title_short = (product.get("title_short") or product.get("title") or "").strip()
+    if not title_short:
+        return None
+    title_node: Optional[ET.Element] = None
+    for node in root.iter():
+        if (node.get("resource-id") or "").strip() != TITLE_RID or node.get("package") != package:
+            continue
+        t = (node.get("text") or node.get("content-desc") or "").strip()
+        if not t:
+            continue
+        # 匹配标题（允许截断或完全一致）
+        if title_short in t or t in title_short or title_short[:20] in t:
+            title_node = node
+            break
+    if title_node is None:
+        return None
+    title_b = _bounds_attrs(title_node)
+    if not title_b or title_b[3] <= title_b[1]:
+        return None
+    card: Optional[ET.Element] = None
+    for n in root.iter():
+        if n.get("class") != "android.view.ViewGroup" or n.get("package") != package:
+            continue
+        b = _bounds_attrs(n)
+        if len(b) < 4:
+            continue
+        h = b[3] - b[1]
+        if h < PRODUCT_CARD_MIN_HEIGHT or h > 900:
+            continue
+        if b[0] <= title_b[0] and b[1] <= title_b[1] and b[2] >= title_b[2] and b[3] >= title_b[3]:
+            if card is None or (b[3] - b[1]) < (_bounds_attrs(card)[3] - _bounds_attrs(card)[1]):
+                card = n
+    return card
+
+
+def _find_plus_button_in_card(card: ET.Element) -> Optional[Tuple[int, int, int, int]]:
+    """
+    在商品卡内用 bounds 定位「右下角」区域，找该区域内可点击的 ImageView（加号为图片，无文字）。
+    参考 store.xml：加号为 ImageView clickable=true，如 [971,1643][1060,1701]。
+    策略：用卡片 bounds 划出右下角（右约 25% 宽、下约 25% 高），在该区域内找 clickable 的
+    ImageView；若无则找任意 clickable 节点；取右边缘、下边缘最大者（最靠右下角）。
+    """
+    card_b = _bounds_attrs(card)
+    if len(card_b) < 4:
+        return None
+    c_x1, c_y1, c_x2, c_y2 = card_b
+    card_w = c_x2 - c_x1
+    card_h = c_y2 - c_y1
+    # 右下角区域：卡片右 25% 宽、下 25% 高（加号图片固定在此角）
+    right_zone_x1 = c_x1 + int(card_w * 0.75)
+    bottom_zone_y1 = c_y1 + int(card_h * 0.75)
+    # 节点需与此区域有交集：节点右缘 >= 区域左缘 且 节点下缘 >= 区域上缘
+    def in_corner(b: Tuple[int, int, int, int]) -> bool:
+        return b[2] >= right_zone_x1 and b[3] >= bottom_zone_y1
+
+    image_candidates: List[Tuple[int, int, int, int]] = []
+    any_clickable: List[Tuple[int, int, int, int]] = []
+    for n in card.iter():
+        if (n.get("clickable") or "").strip() != "true":
+            continue
+        b = _bounds_attrs(n)
+        if len(b) < 4 or not in_corner(b):
+            continue
+        area = (b[2] - b[0]) * (b[3] - b[1])
+        if area < 400 or area > 50000:  # 按钮级大小，排除整卡或噪点
+            continue
+        cls = (n.get("class") or "").strip()
+        if "ImageView" in cls:
+            image_candidates.append(b)
+        any_clickable.append(b)
+    # 优先用右下角内的可点击 ImageView；若无则用任意可点击
+    candidates = image_candidates if image_candidates else any_clickable
+    if not candidates:
+        return None
+    return max(candidates, key=lambda rect: (rect[2], rect[3]))
+
+
+# 购物车弹窗内「型号/款式」下的「最后x件」正则（参考 pdd_skills/mocks/cart.xml）
+_LAST_PIECES_RE = re.compile(r"最后\s*(\d+)\s*件")
+
+# 弹窗中需排除的文案（非规格行）；规格区标题用于定位，不参与收集
+_CART_POPUP_SKIP_TEXTS = frozenset({
+    "型号", "款式", "颜色", "关闭", "取消", "×", "X",
+    "手动添加地址", "优惠", "添加", "提交订单", "减少数量", "增加数量",
+    "已选", "商品主图", "用多多支付", "使用#微信支付", "更换支付方式", "打开大图",
+})
+
+
+# 只保留含「最后X件」的规格行（型号/款式）
+_LAST_PIECES_IN_LINE_RE = re.compile(r"最后\s*\d+\s*件")
+# 排除仅「最后X件」无规格名的行（row 可能单独成行）
+_ONLY_LAST_PIECES_RE = re.compile(r"^最后\s*\d+\s*件\s*$")
+
+
+# 规格区标题（型号/款式/颜色），用于定位规格列表起点（参考 cart.xml 款式、cart2 颜色）
+_CART_SECTION_HEADERS = ("型号", "款式", "颜色")
+
+
+def _spec_name_from_view_group(node: ET.Element) -> Optional[str]:
+    """从 ViewGroup 节点取规格名：content-desc 或子节点 tv_content 的 text。"""
+    desc = (node.get("content-desc") or "").strip()
+    if desc and desc not in _CART_POPUP_SKIP_TEXTS:
+        return desc
+    for c in node.iter():
+        if "tv_content" in (c.get("resource-id") or ""):
+            t = (c.get("text") or "").strip()
+            if t and t not in _CART_POPUP_SKIP_TEXTS:
+                return t
+    return None
+
+
+def _parse_cart_popup_xml_to_last_pieces_lines(xml_str: str) -> List[str]:
+    """
+    解析加购弹窗 XML（参考 mocks/cart.xml, cart1, cart2, cart3）。
+    cart：款式 + 规格行内 text「最后3件」；cart2/cart3：颜色 + RecyclerView 内 content-desc 规格名 + 独立 TextView「最后X件」。
+    只提取含有「最后X件」的规格行，返回行列表（每行一条，如 "规格A 最后2件"）。
+    """
+    try:
+        root = ET.fromstring(xml_str)
+    except ET.ParseError:
+        return []
+    package = PDD_PACKAGE
+    section_y: Optional[int] = None
+    for n in root.iter():
+        if n.get("package") != package:
+            continue
+        t = (n.get("text") or "").strip()
+        if t not in _CART_SECTION_HEADERS:
+            continue
+        b = _parse_bounds(n.get("bounds") or "")
+        if b and len(b) >= 4:
+            section_y = (b[1] + b[3]) // 2
+            break
+    bottom_cutoff = 2200
+    seen_lines: Set[str] = set()
+
+    # cart2/cart3：含「最后X件」的 TextView 在其 ViewGroup 内，规格名在 content-desc 或 tv_content
+    parent_map: Dict[ET.Element, ET.Element] = {}
+    for p in root.iter():
+        for c in p:
+            parent_map[c] = p
+    for n in root.iter():
+        if n.get("package") != package:
+            continue
+        text = (n.get("text") or "").strip()
+        if not _LAST_PIECES_IN_LINE_RE.search(text):
+            continue
+        b = _parse_bounds(n.get("bounds") or "")
+        if not b or len(b) < 4:
+            continue
+        y_c = (b[1] + b[3]) // 2
+        if section_y is not None and y_c <= section_y:
+            continue
+        if y_c >= bottom_cutoff:
+            continue
+        cur = n
+        while cur in parent_map:
+            cur = parent_map[cur]
+            if (cur.get("class") or "").find("ViewGroup") == -1:
+                continue
+            bcur = _parse_bounds(cur.get("bounds") or "")
+            if not bcur or len(bcur) < 4 or (section_y is not None and (bcur[1] + bcur[3]) // 2 <= section_y):
+                continue
+            spec = _spec_name_from_view_group(cur)
+            if spec:
+                line = f"{spec.strip()} {text}".strip()
+                if line and line not in seen_lines:
+                    seen_lines.add(line)
+                break
+    lines_from_cards: List[str] = sorted(seen_lines)
+
+    # cart 风格：按 y 分行，同一行内规格名 + 最后X件 在一起
+    items: List[Tuple[str, int, int]] = []
+    for n in root.iter():
+        if n.get("package") != package:
+            continue
+        b = _parse_bounds(n.get("bounds") or "")
+        if not b or len(b) < 4:
+            continue
+        y_c = (b[1] + b[3]) // 2
+        if section_y is not None and y_c <= section_y:
+            continue
+        if y_c >= bottom_cutoff:
+            continue
+        x_c = (b[0] + b[2]) // 2
+        for raw in (n.get("text") or "", n.get("content-desc") or ""):
+            t = raw.strip()
+            if not t or t in _CART_POPUP_SKIP_TEXTS:
+                continue
+            if any(skip in t for skip in ("已选:", "¥", "减", "更换支付")):
+                continue
+            items.append((t, y_c, x_c))
+    if items:
+        items.sort(key=lambda x: (x[1], x[2]))
+        row_y: Optional[int] = None
+        row_threshold = 55
+        current: List[str] = []
+        for t, y, _ in items:
+            if row_y is not None and abs(y - row_y) > row_threshold and current:
+                line = " ".join(current).strip()
+                if line and _LAST_PIECES_IN_LINE_RE.search(line) and not _ONLY_LAST_PIECES_RE.match(line) and line not in seen_lines:
+                    seen_lines.add(line)
+                current = []
+            row_y = y
+            if t not in current:
+                current.append(t)
+        if current:
+            line = " ".join(current).strip()
+            if line and _LAST_PIECES_IN_LINE_RE.search(line) and not _ONLY_LAST_PIECES_RE.match(line) and line not in seen_lines:
+                seen_lines.add(line)
+
+    # 仅「最后X件」无规格名的行不纳入
+    result = [ln for ln in lines_from_cards if not _ONLY_LAST_PIECES_RE.match(ln)]
+    for ln in sorted(seen_lines):
+        if ln not in result and not _ONLY_LAST_PIECES_RE.match(ln):
+            result.append(ln)
+    return result
+
+
+def _parse_cart_popup_xml(xml_str: str) -> str:
+    """
+    解析加购弹窗 XML，只保留含「最后X件」的型号/款式行，每行一条，用换行符连接。
+    """
+    lines = _parse_cart_popup_xml_to_last_pieces_lines(xml_str)
+    return "\n".join(lines) if lines else ""
+
+
+def _close_cart_popup(u: Any, screen_w: int = 540, screen_h: int = 960) -> bool:
+    """仅在当前确认为购物车弹窗时才按 back 关闭，避免误退上级页。"""
+    u.dump()
+    out = u.last_result
+    if not out.get("ok"):
+        _log("购物车: 关弹窗 dump 失败，不按 back")
+        return False
+    xml_str = (out.get("result") or {}).get("xml") or ""
+    is_cart = "关闭" in xml_str or any(h in xml_str for h in _CART_SECTION_HEADERS)
+    if not is_cart:
+        _log("===============购物车: 关弹窗 当前不在购物车弹窗内，不按 back==========")
+        return True
+    u.press("back")
+    time.sleep(0.5)
+    return True
+
+
+def _find_scrollable_spec_recycler_bounds(
+    xml_str: str, package: str = PDD_PACKAGE
+) -> Optional[Tuple[Tuple[int, int, int, int], str]]:
+    """
+    在弹窗 XML 中找规格区的可滑动 RecyclerView，返回 (bounds, orientation)。
+    orientation: "vertical" 竖滑（高>宽）、"horizontal" 横滑（宽>=高），根据 bounds 宽高比推断。
+    """
+    try:
+        root = ET.fromstring(xml_str)
+    except ET.ParseError:
+        return None
+    section_y: Optional[int] = None
+    for n in root.iter():
+        if n.get("package") != package:
+            continue
+        t = (n.get("text") or "").strip()
+        if t not in _CART_SECTION_HEADERS:
+            continue
+        b = _parse_bounds(n.get("bounds") or "")
+        if b and len(b) >= 4:
+            section_y = (b[1] + b[3]) // 2
+            break
+    for n in root.iter():
+        if n.get("package") != package:
+            continue
+        if "RecyclerView" not in (n.get("class") or ""):
+            continue
+        if (n.get("scrollable") or "").strip() != "true":
+            continue
+        b = _parse_bounds(n.get("bounds") or "")
+        if len(b) < 4:
+            continue
+        if section_y is not None and b[1] < section_y - 200:
+            continue
+        if b[3] > 2200:
+            continue
+        w, h = b[2] - b[0], b[3] - b[1]
+        orientation = "vertical" if h > w else "horizontal"
+        return (tuple(b), orientation)
+    return None
+
+
+def _collect_cart_remark_with_scroll(
+    u: Any,
+    screen_w: int,
+    screen_h: int,
+    max_scrolls: int = 2,
+    max_scrolls_horizontal: int = 3,
+) -> str:
+    """
+    当前已在加购弹窗内：先 dump 解析一次；若存在可滑动的规格区 RecyclerView（款式/型号/颜色很多时需横滑或竖滑），
+    则在其内竖滑、横滑各若干次，每次 dump 解析，合并所有「最后X件」行后去重，用换行连接返回。
+    """
+    all_lines: List[str] = []
+    seen: Set[str] = set()
+
+    def add_from_xml(xml_str: str) -> None:
+        for line in _parse_cart_popup_xml_to_last_pieces_lines(xml_str):
+            if line and line not in seen:
+                seen.add(line)
+                all_lines.append(line)
+
+    u.dump()
+    out = u.last_result
+    if not out.get("ok"):
+        _log("购物车: dump 失败，返回空备注")
+        return ""
+    popup_xml = (out.get("result") or {}).get("xml") or ""
+    add_from_xml(popup_xml)
+
+    # 仅当确认为购物车弹窗（含关闭或规格区标题）时才在弹窗内滑动，避免误滑店铺列表
+    is_cart = "关闭" in popup_xml or any(h in popup_xml for h in _CART_SECTION_HEADERS)
+    found = _find_scrollable_spec_recycler_bounds(popup_xml) if is_cart else None
+    if found:
+        scroll_bounds, orientation = found
+        sx1, sy1, sx2, sy2 = scroll_bounds
+        cx = (sx1 + sx2) // 2
+        cy = (sy1 + sy2) // 2
+        """
+        _log(f"购物车: 步骤4 找到规格区可滑区域 bounds={scroll_bounds}，推断方向={orientation}（高>宽竖滑，宽>=高横滑）")
+        """
+        if orientation == "vertical":
+            # 竖滑：区域高>宽，规格多行需下滑看全
+            from_y = sy2 - 150
+            to_y = sy1 + 150
+            for i in range(max_scrolls):
+                u.swipe(cx, from_y, cx, to_y, duration=0.25)
+                time.sleep(1)
+                u.dump()
+                o = u.last_result
+                if not o.get("ok"):
+                    _log("购物车: 竖滑后 dump 失败，停止竖滑")
+                    break
+                add_from_xml((o.get("result") or {}).get("xml") or "")
+        else:
+            # 横滑：区域宽>=高，规格横向排列需左滑看全
+            from_x = sx2 - 100
+            to_x = sx1 + 100
+            for i in range(max_scrolls_horizontal):
+                u.swipe(from_x, cy, to_x, cy, duration=0.25)
+                time.sleep(1)
+                u.dump()
+                o = u.last_result
+                if not o.get("ok"):
+                    _log("购物车: 横滑后 dump 失败，停止横滑")
+                    break
+                add_from_xml((o.get("result") or {}).get("xml") or "")
+    else:
+        """_log("购物车: 无规格区可滑区域或非购物车弹窗，不滑动")"""
+    return "\n".join(all_lines) if all_lines else ""
+
+
+def _product_seen_key(p: Dict[str, Any]) -> str:
+    """判重键：优先用 xml_node_id（XML index/bounds），不依赖商品名称价格。"""
+    nid = (p.get("xml_node_id") or "").strip()
+    if nid:
+        return nid
+    title = (p.get("title") or p.get("title_short") or "").strip()
+    return (title or "") + "|" + str(p.get("price") or "")
+
+
+def _normalize_price_for_key(price: Any) -> str:
+    """价格规范化为数字串，便于前后两屏同一商品能匹配（¥88 / 88 / ¥12.5 -> 88 / 12.5）。"""
+    if price is None:
+        return ""
+    s = str(price).strip().replace("¥", "").replace("￥", "").strip()
+    m = re.match(r"^(\d+\.?\d*)", s)
+    return m.group(1) if m else s
+
+
+def _normalize_name_for_key(name: str) -> str:
+    """名字规范化：去首尾空白、多空格合并为一，便于前后两屏匹配。"""
+    if not name:
+        return ""
+    return re.sub(r"\s+", " ", (name or "").strip())
+
+
+def _name_price_key(p: Dict[str, Any]) -> str:
+    """仅按名字+价格判重：同名同价视为同一商品（用于下滑前后两屏去重）。名字和价格均做规范化。"""
+    name = (p.get("title") or p.get("title_short") or "").strip()
+    norm_name = _normalize_name_for_key(name)
+    norm_price = _normalize_price_for_key(p.get("price"))
+    return (norm_name or "") + "|" + (norm_price or "")
+
+
+def _same_product_by_name_price(prod: Dict[str, Any], existing: Dict[str, Any]) -> bool:
+    """
+    两商品是否视为同一（用于同轮两屏去重）：title+价格。
+    价格：都为空视为相同，否则必须规范化后相等。
+    名字：优先用 title_short（两屏一致），相同或一方为另一方前缀即视为同商品。
+    """
+    price_a = _normalize_price_for_key(prod.get("price"))
+    price_b = _normalize_price_for_key(existing.get("price"))
+    if price_a != price_b:
+        if not (not price_a and not price_b):
+            return False
+    # 优先 title_short，保证两屏用同一字段，避免一屏 title 一屏 title_short 导致不匹配
+    name_a = _normalize_name_for_key(prod.get("title_short") or prod.get("title") or "")
+    name_b = _normalize_name_for_key(existing.get("title_short") or existing.get("title") or "")
+    if not name_a or not name_b:
+        return (name_a or "") == (name_b or "")
+    if name_a == name_b:
+        return True
+    if name_a.startswith(name_b) or name_b.startswith(name_a):
+        return True
+    return False
+
+
+def _enrich_cart_remark_on_screen(
+    u: Any,
+    parsed: Dict[str, Any],
+    xml_str: str,
+    screen_w: int,
+    screen_h: int,
+    seen_with_remark: Set[str],
+    enrich_every_product: bool = False,
+    max_cart_scrolls: int = 2,
+) -> None:
+    """
+    对当前屏商品：若 enrich_every_product 为 True 则每个都点进购物车取备注；
+    否则仅对「仅剩/即将售罄」且未处理过的商品点进购物车。
+    是否已处理过以 xml_node_id（或 title|price 回退）为准，不依赖名称价格判重。
+    弹窗内支持多种样式（cart/cart1/cart2/cart3）；规格多时竖滑 max_cart_scrolls 次（默认 2）+横滑 5 次收集「最后X件」。
+    备注只记录含「最后X件」的型号/款式，每行一条（换行分隔）。
+    """
+    products = parsed.get("products") or []
+    try:
+        root = ET.fromstring(xml_str)
+    except ET.ParseError:
+        return
+    for p in products:
+        key = _product_seen_key(p)
+        if not enrich_every_product:
+            if not _should_open_cart_for_remark(p):
+                continue
+            if key in seen_with_remark:
+                continue
+        else:
+            if key in seen_with_remark:
+                continue
+        seen_with_remark.add(key)
+        title_short = (p.get("title_short") or p.get("title") or "").strip()[:30]
+        _log(f"购物车: [商品] 打开加购弹窗取备注: {title_short!r}...")
+        u.dump()
+        out = u.last_result
+        if not out.get("ok"):
+            _log("购物车: [商品] dump 失败，跳过该商品")
+            continue
+        fresh_xml = (out.get("result") or {}).get("xml") or ""
+        if not fresh_xml:
+            _log("购物车: [商品] 无 xml，跳过该商品")
+            continue
+        try:
+            fresh_root = ET.fromstring(fresh_xml)
+        except ET.ParseError:
+            _log("购物车: [商品] xml 解析失败，跳过该商品")
+            continue
+        card = _find_card_for_product(fresh_root, p)
+        if card is None:
+            _log("购物车: [商品] 未找到该商品卡片，跳过")
+            continue
+        plus_bounds = _find_plus_button_in_card(card)
+        if not plus_bounds:
+            _log("购物车: [商品] 未找到卡片内「+」按钮，跳过")
+            continue
+        cx = (plus_bounds[0] + plus_bounds[2]) // 2
+        cy = (plus_bounds[1] + plus_bounds[3]) // 2
+        u.click(x=cx, y=cy)
+        time.sleep(1)
+        remark = _collect_cart_remark_with_scroll(u, screen_w, screen_h, max_scrolls=max_cart_scrolls)
+        p["备注"] = remark or ""
+        if remark:
+            _log(f"购物车: [商品] {remark[:60]}{'...' if len(remark) > 60 else ''!r}")
+        _close_cart_popup(u, screen_w, screen_h)
+        time.sleep(0.5)
+
+
+def _enrich_cart_remark_for_products(
+    u: Any,
+    products: List[Dict[str, Any]],
+    screen_w: int,
+    screen_h: int,
+    max_cart_scrolls: int = 2,
+) -> None:
+    """
+    仅对给定的商品列表逐个进购物车取备注；每关闭弹窗只 press back 一次，避免退出上级页。
+    """
+
+    for p in products:
+        title_short = (p.get("title_short") or p.get("title") or "").strip()[:30]
+        u.dump()
+        out = u.last_result
+        if not out.get("ok"):
+            _log("购物车: [tmp商品] dump 失败，跳过该商品")
+            continue
+        fresh_xml = (out.get("result") or {}).get("xml") or ""
+        if not fresh_xml:
+            _log("购物车: [tmp商品] 无 xml，跳过该商品")
+            continue
+        try:
+            fresh_root = ET.fromstring(fresh_xml)
+        except ET.ParseError:
+            _log("购物车: [tmp商品] xml 解析失败，跳过该商品")
+            continue
+        card = _find_card_for_product(fresh_root, p)
+        if card is None:
+            _log("购物车: [tmp商品] 未找到该商品卡片，跳过")
+            continue
+        plus_bounds = _find_plus_button_in_card(card)
+        if not plus_bounds:
+            _log("购物车: [tmp商品] 未找到卡片内「+」按钮，跳过")
+            continue
+        cx = (plus_bounds[0] + plus_bounds[2]) // 2
+        cy = (plus_bounds[1] + plus_bounds[3]) // 2
+        u.click(x=cx, y=cy)
+        time.sleep(1)
+        remark = _collect_cart_remark_with_scroll(u, screen_w, screen_h, max_scrolls=max_cart_scrolls)
+        p["备注"] = remark or ""
+        if remark:
+            """_log(f"备注={remark[:60]}{'...' if len(remark) > 60 else ''!r}")"""
+        _close_cart_popup(u, screen_w, screen_h)
+        time.sleep(0.5)        
+
 def to_csv_rows(store: Dict[str, Any], products: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """将店铺 + 商品列表转为可写 CSV 的扁平行列表。每行包含店铺字段 + 单商品字段 + 缺货标志 + 仅剩。"""
     rows: List[Dict[str, Any]] = []
@@ -813,6 +1510,7 @@ def to_csv_rows(store: Dict[str, Any], products: List[Dict[str, Any]]) -> List[D
             "tags": tags_str,
             "缺货标志": _out_of_stock_flag(tag_list),
             "仅剩": _extract_only_left(p),
+            "备注": (p.get("备注") or "").strip(),
         })
     return rows
 
@@ -911,6 +1609,17 @@ def _bounds_attrs(node: ET.Element) -> tuple:
     if not b or len(b) < 4:
         return (0, 0, 0, 0)
     return b
+
+
+def _bounds_str(node: ET.Element) -> str:
+    """返回节点 bounds 的规范字符串，用于 xml_node_id（同屏内唯一）。"""
+    raw = (node.get("bounds") or "").strip()
+    if raw:
+        return raw
+    b = _bounds_attrs(node)
+    if b != (0, 0, 0, 0):
+        return f"[{b[0]},{b[1]}][{b[2]},{b[3]}]"
+    return ""
 
 
 def _text_in_card(card: ET.Element) -> List[Dict[str, Any]]:
@@ -1079,7 +1788,10 @@ def parse_store_page_xml(xml_str: str) -> Dict[str, Any]:
                 if card is None or (b[3] - b[1]) < (_bounds_attrs(card)[3] - _bounds_attrs(card)[1]):
                     card = n
         if card is not None:
-            products.append(_extract_product_from_card(card, title_node))
+            prod = _extract_product_from_card(card, title_node)
+            prod["xml_node_id"] = _bounds_str(card)  # 同屏内唯一，用于判重（不依赖标题价格）
+            prod["xml_node_index"] = card.get("index") or ""
+            products.append(prod)
         else:
             products.append({
                 "title": (title_node.get("content-desc") or title_node.get("text") or "").strip(),
@@ -1087,6 +1799,8 @@ def parse_store_page_xml(xml_str: str) -> Dict[str, Any]:
                 "price": None,
                 "sales": None,
                 "tags": [],
+                "xml_node_id": _bounds_str(title_node),
+                "xml_node_index": title_node.get("index") or "",
             })
     return {"store": store, "products": products}
 
@@ -1098,12 +1812,15 @@ def dump_store_page(
     store_scroll_no_new_limit: int = 5,
     end_marker: str = STORE_END_MARKER,
     output_csv: Optional[str] = None,
+    no_dedup: bool = True,
+    max_scrolls: int = 5,
+    max_products_scrolls: Optional[int] = None,
 ) -> dict:
     """
     若提供 store_keyword：search_store(店铺名) 进入目标店铺 → 滑到底 dump 并合并 → 结构化（可输出 CSV）。
     流程：ensure_search_page → 点「店铺」→ 输入关键词 → 点「搜索」→ 店铺列表找目标并点击 → scroll_store_to_end。
+    no_dedup=True（默认）：商品不去重、不合并，每个都记录且每个都点进购物车取备注。
     若不提供 store_keyword：仅从当前页 dump 并解析店铺首页。
-    max_products_to_try：CLI 兼容参数，本流程走店铺搜索故忽略。
     返回 {"ok": True, "result": {"store", "products", "rows"?}} 或错误 dict。
     """
     if store_keyword is None or store_keyword.strip() == "":
@@ -1120,14 +1837,24 @@ def dump_store_page(
         parsed = parse_store_page_xml(xml_str)
         return {"ok": True, "result": parsed}
 
-    _log(f"dump_store_page: 开始（店铺搜索流程），目标={store_keyword!r}")
+    _log(f"dump_store_page: 开始（店铺搜索流程），目标={store_keyword!r}，no_dedup={no_dedup}")
     search_out = search_store(store_keyword.strip())
     if not search_out.get("ok"):
         _log(f"dump_store_page: search_store 失败 {search_out}")
+        if search_out.get("error") in ("no_search_elements", "tab_not_found"):
+            _log("dump_store_page: 搜索页异常（未解析到搜索框/按钮或未找到 tab），重启拼多多后返回")
+            open_app(stop=True)
+            time.sleep(1.2)
         return search_out
     _log("dump_store_page: 已进入目标店铺，等待 1.2s 后 scroll_store_to_end...")
     time.sleep(1.2)
-    scroll_out = scroll_store_to_end(no_new_limit=store_scroll_no_new_limit, end_marker=end_marker)
+    scroll_out = scroll_store_to_end(
+        no_new_limit=store_scroll_no_new_limit,
+        end_marker=end_marker,
+        no_dedup=no_dedup,
+        max_cart_scrolls=max_scrolls,
+        max_products_scrolls=max_products_scrolls,
+    )
     if not scroll_out.get("ok"):
         _log(f"dump_store_page: scroll_store_to_end 失败: {scroll_out}")
         return scroll_out
@@ -1156,16 +1883,21 @@ def dump_stores_to_csv(
     max_products_to_try: int = 20,
     store_scroll_no_new_limit: int = 5,
     end_marker: str = STORE_END_MARKER,
+    no_dedup: bool = True,
 ) -> dict:
     """
     依次对多个店铺执行 dump_store_page，将各店 rows 合并后写入一个 CSV。
+    no_dedup=True（默认）：每店商品不去重，每个商品都记录且都点进购物车取备注。
     单店失败时跳过并记录，不中断后续店铺；汇总 CSV 仅含成功店铺数据。
-    返回 {"ok": True, "result": {"success_stores", "failed_stores", "total_rows", "output_csv"}}；
-    若全部失败则 ok 仍为 True，total_rows=0，不写或写空 CSV。
+    返回 {"ok": True, "result": {"success_stores", "failed_stores", "total_rows", "output_csv"}}。
     """
     all_rows: List[Dict[str, Any]] = []
     success_stores: List[str] = []
     failed_stores: List[Dict[str, Any]] = []  # [{"store": kw, "error": ..., "detail": ...}, ...]
+    # 默认先重启 app，从干净首页开始，避免残留页面导致搜索框/tab 解析失败
+    _log("dump_stores_to_csv: 重启拼多多，从首页开始...")
+    open_app(stop=True)
+    time.sleep(1.2)
     for i, kw in enumerate(store_keywords):
         kw = (kw or "").strip()
         if not kw:
@@ -1174,7 +1906,7 @@ def dump_stores_to_csv(
         if i > 0:
             _log("dump_stores_to_csv: 返回首页以搜索下一店铺（重启拼多多）...")
             open_app(stop=True)
-            time.sleep(1.2)
+            time.sleep(3.2)
         _log(f"dump_stores_to_csv: 处理店铺 {kw!r} ({len(success_stores) + len(failed_stores) + 1}/{len(store_keywords)})")
         out = dump_store_page(
             store_keyword=kw,
@@ -1182,6 +1914,7 @@ def dump_stores_to_csv(
             store_scroll_no_new_limit=store_scroll_no_new_limit,
             end_marker=end_marker,
             output_csv=None,
+            no_dedup=no_dedup,
         )
         if out.get("ok"):
             rows = (out.get("result") or {}).get("rows") or []
@@ -1195,6 +1928,10 @@ def dump_stores_to_csv(
                 "detail": out.get("detail", ""),
             })
             _log(f"dump_stores_to_csv: 店铺 {kw!r} 失败，跳过: {out.get('error')} {out.get('detail', '')}")
+            if out.get("error") in ("no_search_elements", "tab_not_found"):
+                _log("dump_stores_to_csv: 搜索页异常（未解析到搜索框/按钮或未找到 tab），重启拼多多以便下一店铺正常搜索")
+                open_app(stop=True)
+                time.sleep(1.2)
     if all_rows:
         _log(f"dump_stores_to_csv: 写入汇总 CSV {output_csv}，共 {len(all_rows)} 行")
         write_store_csv(all_rows, output_csv)
@@ -1246,7 +1983,6 @@ def dump_store_page_by_product(
 
     # 完整流程：搜索商品 → 点商品找进店 → 进店后滑到底并采集
     _log(f"dump_store_page_by_product: 开始完整流程，目标店铺关键词={store_keyword!r}")
-    _log("dump_store_page_by_product: 步骤 1 打开搜索页并获取搜索框/按钮位置")
     page_out = ensure_search_page()
     if not page_out.get("ok"):
         _log(f"dump_store_page_by_product: ensure_search_page 失败 {page_out}")
@@ -1254,8 +1990,7 @@ def dump_store_page_by_product(
     page_el = page_out.get("result") or {}
     _log("dump_store_page_by_product: 切换到「商品」搜索")
     select_search_tab(store=False)
-    time.sleep(0.3)
-    _log("dump_store_page_by_product: 步骤 2 搜索 store_keyword（商品列表）")
+    time.sleep(1)
     search(
         store_keyword.strip(),
         search_input=page_el.get("search_input"),
@@ -1263,7 +1998,6 @@ def dump_store_page_by_product(
     )
     time.sleep(1.2)
     u = _u()
-    _log("dump_store_page: 步骤 3 获取商品可点击列表（可下滑多屏凑满最多 {} 个）".format(max_products_to_try))
     seen_centers: Set[Tuple[int, int]] = set()
     targets: List[Dict[str, Any]] = []
     win = u.window_size()
@@ -1291,41 +2025,33 @@ def dump_store_page_by_product(
             seen_centers.add(key)
             targets.append(t)
             added += 1
-        _log(f"dump_store_page: 本屏 {len(new_list)} 个，新增 {added}，累计 {len(targets)} 个")
         if len(targets) >= max_products_to_try:
             break
         if scroll_round < max_scrolls - 1:
-            u.swipe(fx, fy, tx, ty, duration=0.25)
+            u.swipe(fx, fy, tx, ty, duration=0.3)
             time.sleep(1.0)
     targets = targets[:max_products_to_try]
-    _log(f"dump_store_page: 共 {len(targets)} 个商品，依次点击找进店（最多 {max_products_to_try}）")
     entered = False
     for idx, t in enumerate(targets):
-        _log(f"dump_store_page: 商品 {idx+1}/{len(targets)} 点击 ({t.get('title', '')[:20]}...)")
         cx, cy = t.get("center") or (0, 0)
         u.click(x=cx, y=cy)
         time.sleep(1.2)
-        _log(f"dump_store_page: 商品 {idx+1} 进入详情页，dump_product_detail...")
         detail_out = dump_product_detail(max_scrolls=max_detail_scrolls)
         if not detail_out.get("ok"):
-            _log(f"dump_store_page: 商品 {idx+1} dump_product_detail 失败，返回列表")
             u.press("back")
-            time.sleep(0.8)
+            time.sleep(1.0)
             continue
         detail = detail_out.get("result") or {}
         store_block = detail.get("store") or {}
         store_name = (store_block.get("name") or "").strip()
-        _log(f"dump_store_page: 商品 {idx+1} 店铺名={store_name!r}, 目标={store_keyword!r}")
         if store_name and (store_keyword in store_name or store_name in store_keyword):
             cen = store_block.get("enter_center")
             if cen:
-                _log(f"dump_store_page: 匹配目标店铺，点击进店")
                 u.click(x=cen[0], y=cen[1])
                 entered = True
                 break
-        _log(f"dump_store_page: 非目标店铺，返回列表")
         u.press("back")
-        time.sleep(0.8)
+        time.sleep(1.0)
     if not entered:
         _log("dump_store_page: 未找到目标店铺，退出")
         return {
@@ -1333,13 +2059,11 @@ def dump_store_page_by_product(
             "error": "store_not_found",
             "detail": f"在 {max_products_to_try} 个商品详情页未找到目标店铺「{store_keyword}」",
         }
-    _log("dump_store_page: 步骤 4 进店完成，等待 1.2s 后 scroll_store_to_end...")
     time.sleep(1.2)
     scroll_out = scroll_store_to_end(no_new_limit=store_scroll_no_new_limit, end_marker=end_marker)
     if not scroll_out.get("ok"):
         _log(f"dump_store_page: scroll_store_to_end 失败: {scroll_out}")
         return scroll_out
-    _log("dump_store_page: 步骤 5 合并并结构化")
     merged = (scroll_out.get("result") or {}).get("merged") or {}
     store = merged.get("store") or {}
     products = merged.get("products") or []

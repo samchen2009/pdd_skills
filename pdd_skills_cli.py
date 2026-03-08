@@ -47,6 +47,8 @@ def main() -> int:
     p_store.add_argument("--output-csv", dest="output_csv", default=None, help="完整流程时写入 CSV 路径")
     p_store.add_argument("--max-products", type=int, default=20, dest="max_products", help="最多点击多少个商品找进店")
     p_store.add_argument("--no-new-limit", type=int, default=5, dest="no_new_limit", help="店内滑到底：连续几次无新内容则停")
+    p_store.add_argument("--max-scrolls", type=int, default=2, dest="max_scrolls", help="加购弹窗内规格区竖滑次数（默认2），横滑固定5次")
+    p_store.add_argument("--max-products-scrolls", type=int, default=None, dest="max_products_scrolls", help="店内最多下滑次数（默认无限制，直到底）")
     p_stores = sub.add_parser("dump-stores", help="依次获取多个店铺商品信息并汇总到一个 CSV")
     p_stores.add_argument("stores", nargs="+", help="店铺关键词（可多个，如：店铺A 店铺B）")
     p_stores.add_argument("--output", "-o", dest="output_csv", required=True, help="汇总表格输出路径（CSV）")
@@ -111,6 +113,8 @@ def main() -> int:
                 max_products_to_try=getattr(args, "max_products", 20),
                 store_scroll_no_new_limit=getattr(args, "no_new_limit", 5),
                 output_csv=getattr(args, "output_csv", None),
+                max_scrolls=getattr(args, "max_scrolls", 2),
+                max_products_scrolls=getattr(args, "max_products_scrolls", None),
             ))
         elif args.command == "dump-stores":
             result = dump_stores_to_csv(

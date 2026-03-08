@@ -31,11 +31,7 @@ python pdd_skills/pdd_skills.py <command> [args]
 | `ensure-search-page` | Open Pinduoduo and go to search page (clicks "搜索" if not already there) |
 | `search KEYWORD` | Search inside the app (optional `--search-button` for button text) |
 | `dump-products` | Parse product list from current page (`--limit N`, default 10) |
-| `dump-product-detail` | From current **product detail page**: parse product info + store name + "进店" (enter store) position (`--max-scrolls` for detail scrolls) |
-| `get-product-click-targets` | Parse clickable product positions on current page (for stepping into details) |
-| `dump-store-page [STORE]` | **No STORE**: dump and parse current page as store home. **With STORE**: full flow (see below), optional `--output-csv` |
 | `dump-stores STORE1 [STORE2 ...] -o FILE` | Collect multiple stores in sequence and merge into one CSV |
-| `parse-store-xml FILE` | Parse a local store.xml (no device needed) |
 
 ## dump-store-page full flow (when store keyword is given)
 
@@ -73,17 +69,6 @@ python pdd_skills/pdd_skills_cli.py search 3CE
 # Parse products on current page (max 5)
 python pdd_skills/pdd_skills_cli.py dump-products --limit 5
 
-# From product detail page: parse product + store (enter-store button)
-python pdd_skills/pdd_skills_cli.py dump-product-detail --max-scrolls 5
-
-# Full flow: search store keyword → enter store → scroll to end → output CSV
-python pdd_skills/pdd_skills_cli.py dump-store-page "StoreName" --output-csv store.csv
-
-# Only parse current page as store home (no store arg)
-python pdd_skills/pdd_skills_cli.py dump-store-page
-
-# Parse local store XML
-python pdd_skills/pdd_skills_cli.py parse-store-xml pdd_skills/mocks/store.xml
 ```
 
 ## Dependencies
