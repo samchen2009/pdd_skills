@@ -808,7 +808,7 @@ def scroll_store_to_end(
             must sleep enough time to let the screen freeze
             otherwise, click(x,y) will fail
         """
-        time.sleep(2)
+        time.sleep(1.5)
 
     merged_products: List[Dict[str, Any]] = []
     for batch in parsed_list:
@@ -1433,8 +1433,9 @@ def _enrich_cart_remark_on_screen(
         if not plus_bounds:
             _log("购物车: [商品] 未找到卡片内「+」按钮，跳过")
             continue
-        cx = (plus_bounds[0] + plus_bounds[2]) // 2
-        cy = (plus_bounds[1] + plus_bounds[3]) // 2
+        # 点加号最右上角，避免被悬浮窗挡住
+        cx = plus_bounds[2] - 2
+        cy = plus_bounds[1] + 2
         u.click(x=cx, y=cy)
         time.sleep(1)
         remark = _collect_cart_remark_with_scroll(u, screen_w, screen_h, max_scrolls=max_cart_scrolls)
@@ -1480,8 +1481,9 @@ def _enrich_cart_remark_for_products(
         if not plus_bounds:
             _log("购物车: [tmp商品] 未找到卡片内「+」按钮，跳过")
             continue
-        cx = (plus_bounds[0] + plus_bounds[2]) // 2
-        cy = (plus_bounds[1] + plus_bounds[3]) // 2
+        # 点加号最右上角，避免被悬浮窗挡住
+        cx = plus_bounds[2] - 2
+        cy = plus_bounds[1] + 2
         u.click(x=cx, y=cy)
         time.sleep(1)
         remark = _collect_cart_remark_with_scroll(u, screen_w, screen_h, max_scrolls=max_cart_scrolls)
