@@ -1,6 +1,5 @@
 # Bytecode
 __pycache__/
-*.py[cod]
 *$py.class
 
 # Virtual env
