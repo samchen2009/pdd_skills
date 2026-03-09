@@ -352,7 +352,7 @@ def search_store(store_name: str) -> dict:
         name = (item.get("store_name") or "").strip()
         if not name:
             continue
-        if target_store_name in name or name in target_store_name:
+        if name == target_store_name:
             cx, cy = item.get("enter_center") or item.get("center") or (0, 0)
             _log(f"search_store: 点击目标店铺「进店」 {name!r} at ({cx},{cy})")
             u.click(x=cx, y=cy)
@@ -373,7 +373,7 @@ def search_store(store_name: str) -> dict:
         items = _parse_store_search_result_xml(xml_str)
         for item in items:
             name = (item.get("store_name") or "").strip()
-            if target_store_name in name or name in target_store_name:
+            if name == target_store_name:
                 cx, cy = item.get("enter_center") or item.get("center") or (0, 0)
                 _log(f"search_store: 下滑后点击目标店铺「进店」 {name!r}")
                 u.click(x=cx, y=cy)
@@ -751,6 +751,17 @@ def scroll_store_to_end(
     fx, fy = w // 2, int(h * 0.75)
     tx, ty = w // 2, int(h * 0.25)
     _log(f"scroll_store_to_end: 屏幕 {w}x{h}, 下滑坐标 from=({fx},{fy}) to=({tx},{ty}), no_new_limit={no_new_limit}, max_products_scrolls={max_products_scrolls}")
+    # 进入前先关掉可能存在的运行中干扰弹窗（如「确定放弃吗?」「先去逛逛」）
+    for _ in range(2):
+        u.dump()
+        out = u.last_result
+        if not out.get("ok"):
+            break
+        xml_str = (out.get("result") or {}).get("xml") or ""
+        if not _is_intrusive_popup(xml_str):
+            break
+        _dismiss_intrusive_popup(u, w, h)
+        time.sleep(0.3)
     # parsed_list: 存放每屏 merge 结果（每项是一批新商品）；parsed_in_last_screen: 上一屏新商品，初始为空
     parsed_list: List[List[Dict[str, Any]]] = []
     parsed_in_last_screen: List[Dict[str, Any]] = []
@@ -767,6 +778,18 @@ def scroll_store_to_end(
             _log("scroll_store_to_end: dump 失败")
             return out
         xml_str = (out.get("result") or {}).get("xml") or ""
+        # 若为运行中干扰弹窗则关闭，再 dump 一次用新界面解析
+        for _ in range(2):
+            if not _is_intrusive_popup(xml_str):
+                break
+            _dismiss_intrusive_popup(u, w, h)
+            time.sleep(0.3)
+            u.dump()
+            out = u.last_result
+            if not out.get("ok"):
+                _log("scroll_store_to_end: 关弹窗后 dump 失败")
+                return out
+            xml_str = (out.get("result") or {}).get("xml") or ""
         parsed = parse_store_page_xml(xml_str)
         if not store and (parsed.get("store") or {}):
             store = parsed.get("store") or {}
@@ -1208,6 +1231,100 @@ def _close_cart_popup(u: Any, screen_w: int = 540, screen_h: int = 960) -> bool:
     return True
 
 
+# 运行中干扰弹窗（如「确定放弃吗?」「先去逛逛」），与购物车弹窗区分，需点击关闭/先去逛逛
+_INTRUSIVE_POPUP_MARKERS = ("确定放弃吗?", "先去逛逛")
+
+
+def _is_intrusive_popup(xml_str: str) -> bool:
+    """当前 dump 是否为干扰弹窗（非购物车弹窗）。有「确定放弃吗?」或「先去逛逛」且非购物车即视为干扰弹窗。"""
+    if not xml_str:
+        return False
+    is_cart = "关闭" in xml_str or any(h in xml_str for h in _CART_SECTION_HEADERS)
+    if is_cart:
+        return False
+    return any(m in xml_str for m in _INTRUSIVE_POPUP_MARKERS)
+
+
+def _find_popup_dismiss_target(
+    xml_str: str, screen_w: int, screen_h: int, package: str = PDD_PACKAGE
+) -> Optional[Tuple[int, int]]:
+    """
+    在干扰弹窗 XML 中找关闭点击坐标。优先「先去逛逛」按钮中心；否则找右上角可点击节点（如关闭 X）。
+    返回 (x, y) 或 None。
+    """
+    try:
+        root = ET.fromstring(xml_str)
+    except ET.ParseError:
+        return None
+    # 1) 优先：含「先去逛逛」的节点（可点击的用其 bounds，否则用文案节点自身 bounds 中心）
+    for n in root.iter():
+        if n.get("package") != package:
+            continue
+        t = (n.get("text") or "").strip()
+        if t != "先去逛逛":
+            continue
+        b = _parse_bounds(n.get("bounds") or "")
+        if b and len(b) >= 4:
+            return ((b[0] + b[2]) // 2, (b[1] + b[3]) // 2)
+    for n in root.iter():
+        if n.get("package") != package:
+            continue
+        if (n.get("clickable") or "").strip() != "true":
+            continue
+        for child in n.iter():
+            if (child.get("text") or "").strip() == "先去逛逛":
+                b = _parse_bounds(n.get("bounds") or "")
+                if b and len(b) >= 4:
+                    return ((b[0] + b[2]) // 2, (b[1] + b[3]) // 2)
+                break
+    # 2) 右上角可点击节点：右 15% 宽、上 35% 高，面积不宜过大
+    right_min = int(screen_w * 0.85)
+    top_max = int(screen_h * 0.35)
+    best: Optional[Tuple[int, int, int, int]] = None
+    for n in root.iter():
+        if n.get("package") != package:
+            continue
+        if (n.get("clickable") or "").strip() != "true":
+            continue
+        b = _parse_bounds(n.get("bounds") or "")
+        if not b or len(b) < 4:
+            continue
+        if b[2] < right_min or b[1] > top_max:
+            continue
+        area = (b[2] - b[0]) * (b[3] - b[1])
+        if area < 400 or area > 120000:
+            continue
+        if best is None or (b[2], -b[1]) > (best[2], -best[1]):
+            best = b
+    if best:
+        return ((best[0] + best[2]) // 2, (best[1] + best[3]) // 2)
+    return None
+
+
+def _dismiss_intrusive_popup(u: Any, screen_w: int, screen_h: int) -> bool:
+    """
+    若当前为干扰弹窗则关闭：dump → 检测 → 点「先去逛逛」或右上角关闭 → 返回 True；否则返回 False。
+    最多尝试关闭一次（不在此内循环，由调用方决定是否再次 dump 后重试）。
+    """
+    u.dump()
+    out = u.last_result
+    if not out.get("ok"):
+        return False
+    xml_str = (out.get("result") or {}).get("xml") or ""
+    if not _is_intrusive_popup(xml_str):
+        return False
+    target = _find_popup_dismiss_target(xml_str, screen_w, screen_h)
+    if target:
+        _log("运行中弹窗: 检测到干扰弹窗，点击关闭")
+        u.click(x=target[0], y=target[1])
+        time.sleep(0.6)
+        return True
+    _log("运行中弹窗: 检测到干扰弹窗但未找到关闭按钮，尝试 back")
+    u.press("back")
+    time.sleep(0.5)
+    return True
+
+
 def _find_scrollable_spec_recycler_bounds(
     xml_str: str, package: str = PDD_PACKAGE
 ) -> Optional[Tuple[Tuple[int, int, int, int], str]]:
@@ -1330,12 +1447,19 @@ def _product_seen_key(p: Dict[str, Any]) -> str:
 
 
 def _normalize_price_for_key(price: Any) -> str:
-    """价格规范化为数字串，便于前后两屏同一商品能匹配（¥88 / 88 / ¥12.5 -> 88 / 12.5）。"""
+    """价格规范化为数字串，便于前后两屏同一商品能匹配（¥88 / 88 / 88.00 -> 88；¥12.5 / 12.50 -> 12.5）。"""
     if price is None:
         return ""
     s = str(price).strip().replace("¥", "").replace("￥", "").strip()
     m = re.match(r"^(\d+\.?\d*)", s)
-    return m.group(1) if m else s
+    if not m:
+        return s
+    num_str = m.group(1)
+    try:
+        v = float(num_str)
+        return str(int(v)) if v == int(v) else str(v)
+    except (ValueError, OverflowError):
+        return num_str
 
 
 def _normalize_name_for_key(name: str) -> str:
@@ -1420,6 +1544,22 @@ def _enrich_cart_remark_on_screen(
         if not fresh_xml:
             _log("购物车: [商品] 无 xml，跳过该商品")
             continue
+        # 若突然出现干扰弹窗（如关购物车后弹出的「确定放弃吗?」），先关掉再解析
+        skip_product = False
+        for _ in range(3):
+            if not _is_intrusive_popup(fresh_xml):
+                break
+            _dismiss_intrusive_popup(u, screen_w, screen_h)
+            time.sleep(0.3)
+            u.dump()
+            out = u.last_result
+            if not out.get("ok"):
+                _log("购物车: [商品] 关弹窗后 dump 失败，跳过该商品")
+                skip_product = True
+                break
+            fresh_xml = (out.get("result") or {}).get("xml") or ""
+        if skip_product:
+            continue
         try:
             fresh_root = ET.fromstring(fresh_xml)
         except ET.ParseError:
@@ -1467,6 +1607,22 @@ def _enrich_cart_remark_for_products(
         fresh_xml = (out.get("result") or {}).get("xml") or ""
         if not fresh_xml:
             _log("购物车: [tmp商品] 无 xml，跳过该商品")
+            continue
+        # 若突然出现干扰弹窗，先关掉再解析，避免点到弹窗上
+        skip_product = False
+        for _ in range(3):
+            if not _is_intrusive_popup(fresh_xml):
+                break
+            _dismiss_intrusive_popup(u, screen_w, screen_h)
+            time.sleep(0.3)
+            u.dump()
+            out = u.last_result
+            if not out.get("ok"):
+                _log("购物车: [tmp商品] 关弹窗后 dump 失败，跳过该商品")
+                skip_product = True
+                break
+            fresh_xml = (out.get("result") or {}).get("xml") or ""
+        if skip_product:
             continue
         try:
             fresh_root = ET.fromstring(fresh_xml)
@@ -1525,6 +1681,481 @@ def write_store_csv(rows: List[Dict[str, Any]], path: str) -> None:
         writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()), extrasaction="ignore")
         writer.writeheader()
         writer.writerows(rows)
+
+
+# ----- 按店铺+商品列表进店搜商品、详情页分享复制链接、产出 banya_hotspots CSV -----
+
+
+def _get_clipboard_pdd(u: Any) -> str:
+    """读取剪贴板，直接使用 uiautomator2 的 d.clipboard（参考 xiaohongshu_skills）。"""
+    try:
+        dev = getattr(u, "_dev", None)
+        d = getattr(dev, "_d", None) if dev else None
+        if d is not None and hasattr(d, "clipboard"):
+            text = d.clipboard
+            if isinstance(text, str) and text.strip():
+                if "no shell command implementation" not in text.lower() and "inaccessible" not in text.lower():
+                    return text.strip()
+    except Exception:
+        pass
+    return ""
+
+
+def _click_share_and_copy_link_pdd(u: Any, screen_w: int, screen_h: int) -> str:
+    """
+    当前在商品详情页：点击右上角分享 → 在下方浮层中找「复制链接」并点击（必要时右滑），再读剪贴板。
+    返回链接字符串，失败返回空。
+    """
+    u.dump()
+    out = u.last_result
+    if not out.get("ok"):
+        return ""
+    xml_str = (out.get("result") or {}).get("xml") or ""
+    try:
+        root = ET.fromstring(xml_str)
+    except ET.ParseError:
+        return ""
+    # 右上角分享：content-desc="分享" 且位置在右上方
+    share_center: Optional[Tuple[int, int]] = None
+    for n in root.iter():
+        if n.get("package") != PDD_PACKAGE:
+            continue
+        if (n.get("clickable") or "").strip() != "true":
+            continue
+        desc = (n.get("content-desc") or "").strip()
+        if desc != "分享":
+            continue
+        b = _parse_bounds(n.get("bounds") or "")
+        if not b or len(b) < 4:
+            continue
+        if b[2] < screen_w * 0.8 or b[1] > screen_h * 0.2:
+            continue
+        share_center = ((b[0] + b[2]) // 2, (b[1] + b[3]) // 2)
+        break
+    if not share_center:
+        _log("banya_hotspots: 未找到详情页分享图标")
+        return ""
+    _log("banya_hotspots: 点击分享")
+    u.click(x=share_center[0], y=share_center[1])
+    time.sleep(1.0)
+    # 浮层中找「复制链接」，可能需右滑
+    for swipe_attempt in range(3):
+        u.dump()
+        out = u.last_result
+        if not out.get("ok"):
+            break
+        xml_str = (out.get("result") or {}).get("xml") or ""
+        try:
+            root = ET.fromstring(xml_str)
+        except ET.ParseError:
+            break
+        for n in root.iter():
+            t = (n.get("text") or "").strip()
+            desc = (n.get("content-desc") or "").strip()
+            if t != "复制链接" and desc != "复制链接":
+                continue
+            b = _parse_bounds(n.get("bounds") or "")
+            if not b or len(b) < 4:
+                continue
+            cx, cy = (b[0] + b[2]) // 2, (b[1] + b[3]) // 2
+            _log("banya_hotspots: 点击复制链接")
+            u.click(x=cx, y=cy)
+            time.sleep(0.8)
+            link = _get_clipboard_pdd(u)
+            if link and "no shell command" not in link.lower() and "inaccessible" not in link.lower():
+                return link.strip()
+            return ""
+        # 未找到则右滑浮层再试
+        u.swipe(int(screen_w * 0.7), int(screen_h * 0.7), int(screen_w * 0.3), int(screen_h * 0.7), duration=0.2)
+        time.sleep(0.5)
+    return ""
+
+
+def _bounds_contain(outer: Optional[Tuple[int, int, int, int]], inner: Optional[Tuple[int, int, int, int]]) -> bool:
+    if not outer or len(outer) < 4 or not inner or len(inner) < 4:
+        return False
+    return outer[0] <= inner[0] and outer[1] <= inner[1] and outer[2] >= inner[2] and outer[3] >= inner[3]
+
+
+def _find_store_search_box_center(
+    xml_str: str, screen_h: int, screen_w: int = 1080, package: str = PDD_PACKAGE
+) -> Optional[Tuple[int, int]]:
+    """
+    店铺首页顶栏「搜索」区域。
+    参考 store.xml：右上角两个图标，左边是搜索、右边是分享。
+    优先：text=搜索 或 content-desc=搜索。
+    其次：先找 content-desc=分享 的节点，再在顶栏中找「在分享左侧」的可点击节点（即右上角左图标=搜索）。
+    最后：顶栏中部可点击节点（中间空白搜索框）。
+    """
+    try:
+        root = ET.fromstring(xml_str)
+    except ET.ParseError:
+        return None
+    top_max_y = 300
+
+    for n in root.iter():
+        if n.get("package") != package:
+            continue
+        b = _parse_bounds(n.get("bounds") or "")
+        if not b or len(b) < 4 or b[1] > top_max_y:
+            continue
+        t = (n.get("text") or "").strip()
+        desc = (n.get("content-desc") or "").strip()
+        if t != "搜索" and desc != "搜索":
+            continue
+        if (n.get("clickable") or "").strip() == "true":
+            return ((b[0] + b[2]) // 2, (b[1] + b[3]) // 2)
+        for parent in root.iter():
+            if n in list(parent.iter()) and parent != n and (parent.get("clickable") or "").strip() == "true":
+                pb = _parse_bounds(parent.get("bounds") or "")
+                if pb and len(pb) >= 4 and pb[1] <= top_max_y:
+                    return ((pb[0] + pb[2]) // 2, (pb[1] + pb[3]) // 2)
+        return ((b[0] + b[2]) // 2, (b[1] + b[3]) // 2)
+
+    # 右上角：先找「分享」图标（排除整屏根节点：只要 bounds 较小的，如宽高均 < 300），再找其左侧的可点击节点（即搜索图标 [873,931]）
+    share_left: Optional[int] = None
+    for n in root.iter():
+        if n.get("package") != package:
+            continue
+        if (n.get("content-desc") or "").strip() != "分享":
+            continue
+        b = _parse_bounds(n.get("bounds") or "")
+        if not b or len(b) < 4 or b[1] > top_max_y:
+            continue
+        w, h = b[2] - b[0], b[3] - b[1]
+        if w > 300 or h > 300:
+            continue
+        share_left = b[0]
+        break
+    if share_left is not None:
+        right_half = int(screen_w * 0.5)
+        best_right = -1
+        best_center: Optional[Tuple[int, int]] = None
+        for n in root.iter():
+            if n.get("package") != package:
+                continue
+            if (n.get("clickable") or "").strip() != "true":
+                continue
+            b = _parse_bounds(n.get("bounds") or "")
+            if not b or len(b) < 4 or b[1] > top_max_y:
+                continue
+            if b[0] < right_half:
+                continue
+            if b[2] >= share_left - 5:
+                continue
+            if b[2] > best_right:
+                best_right = b[2]
+                best_center = ((b[0] + b[2]) // 2, (b[1] + b[3]) // 2)
+        if best_center:
+            return best_center
+
+    # 回退：顶栏中部可点击节点（中间空白搜索框）
+    mid_x_min = int(screen_w * 0.12)
+    mid_x_max = int(screen_w * 0.85)
+    best: Optional[Tuple[int, int, int]] = None  # (cx, cy, width)
+    for n in root.iter():
+        if n.get("package") != package:
+            continue
+        if (n.get("clickable") or "").strip() != "true":
+            continue
+        b = _parse_bounds(n.get("bounds") or "")
+        if not b or len(b) < 4 or b[1] > top_max_y:
+            continue
+        cx = (b[0] + b[2]) // 2
+        if cx < mid_x_min or cx > mid_x_max:
+            continue
+        width = b[2] - b[0]
+        if width < 100:
+            continue
+        if best is None or width > best[2]:
+            best = (cx, (b[1] + b[3]) // 2, width)
+    if best:
+        return (best[0], best[1])
+    return None
+
+
+def _find_in_store_search_input_and_button(
+    xml_str: str, top_max_y: int = 500, package: str = PDD_PACKAGE
+) -> Tuple[Optional[Tuple[int, int]], Optional[Tuple[int, int]]]:
+    """
+    点击店铺内搜索框后的页面：找输入框中心与「搜索」按钮中心。
+    返回 (input_center, button_center)，用于 search_in_store。
+    """
+    try:
+        root = ET.fromstring(xml_str)
+    except ET.ParseError:
+        return (None, None)
+    input_center: Optional[Tuple[int, int]] = None
+    button_center: Optional[Tuple[int, int]] = None
+    for n in root.iter():
+        if n.get("package") != package:
+            continue
+        b = _parse_bounds(n.get("bounds") or "")
+        if not b or len(b) < 4 or b[1] > top_max_y:
+            continue
+        cls = (n.get("class") or "").strip()
+        t = (n.get("text") or "").strip()
+        desc = (n.get("content-desc") or "").strip()
+        if "EditText" in cls or desc == "搜索":
+            if not input_center:
+                input_center = ((b[0] + b[2]) // 2, (b[1] + b[3]) // 2)
+        if t == "搜索" and (n.get("clickable") or "").strip() == "true":
+            button_center = ((b[0] + b[2]) // 2, (b[1] + b[3]) // 2)
+            break
+    if not button_center:
+        for n in root.iter():
+            if n.get("package") != package:
+                continue
+            b = _parse_bounds(n.get("bounds") or "")
+            if not b or len(b) < 4 or b[1] > top_max_y:
+                continue
+            for c in n.iter():
+                if c == n:
+                    continue
+                t = (c.get("text") or "").strip()
+                if t == "搜索":
+                    button_center = ((b[0] + b[2]) // 2, (b[1] + b[3]) // 2)
+                    break
+            if button_center:
+                break
+    return (input_center, button_center)
+
+
+def _find_first_product_poster_center(
+    xml_str: str,
+    product_keyword: str,
+    expected_price: Optional[str] = None,
+    package: str = PDD_PACKAGE,
+) -> Optional[Tuple[int, int]]:
+    """
+    在店铺商品列表/搜索结果 XML 中找第一个标题包含 product_keyword（模糊匹配）且价格与 expected_price 相同（忽略货币符号）的商品卡，
+    返回该卡「海报区」中心（卡片上半部分中心，避免点到加号）。
+    """
+    try:
+        root = ET.fromstring(xml_str)
+    except ET.ParseError:
+        return None
+    keyword = (product_keyword or "").strip()
+    if not keyword:
+        return None
+    # 标题匹配时统一全角＃与半角#，避免列表与页面不一致导致匹配失败
+    def _norm_title(s: str) -> str:
+        return (s or "").replace("\uff03", "#")  # fullwidth # -> #
+    keyword_norm = _norm_title(keyword)
+    norm_expected = _normalize_price_for_key(expected_price) if expected_price else None
+    title_rid = TITLE_RID
+    candidates: List[Tuple[ET.Element, Tuple[int, int]]] = []
+    for node in root.iter():
+        if node.get("package") != package:
+            continue
+        rid = (node.get("resource-id") or "").strip()
+        if rid != title_rid:
+            continue
+        t = (node.get("text") or "").strip()
+        d = (node.get("content-desc") or "").strip()
+        # 列表里是完整商品名，搜索结果里 text 常被截断，完整标题可能在 content-desc
+        title_candidates = [x for x in (t, d) if x]
+        if not title_candidates:
+            continue
+        def _title_matches(k: str, txt: str) -> bool:
+            k, txt = _norm_title(k), _norm_title(txt)
+            if k in txt:
+                return True
+            return txt in k and len(txt) >= 6
+        if not any(_title_matches(keyword_norm, txt) for txt in title_candidates):
+            continue
+        title_b = _parse_bounds(node.get("bounds") or "")
+        if not title_b or len(title_b) < 4:
+            continue
+        # 店铺首页商品卡多为 ViewGroup，店内搜索结果页多为 FrameLayout（参考 search_result.xml）
+        card = None
+        for n in root.iter():
+            if n.get("package") != package:
+                continue
+            cls = (n.get("class") or "").strip()
+            if "ViewGroup" not in cls and "FrameLayout" not in cls:
+                continue
+            b = _parse_bounds(n.get("bounds") or "")
+            if len(b) < 4:
+                continue
+            h = b[3] - b[1]
+            if h < PRODUCT_CARD_MIN_HEIGHT or h > 900:
+                continue
+            if b[0] <= title_b[0] and b[1] <= title_b[1] and b[2] >= title_b[2] and b[3] >= title_b[3]:
+                card_h = b[3] - b[1]
+                if card is None:
+                    card = n
+                else:
+                    cb = _parse_bounds(card.get("bounds") or "")
+                    if cb and len(cb) >= 4 and card_h < (cb[3] - cb[1]):
+                        card = n
+        if card is not None:
+            if norm_expected is not None:
+                prod = _extract_product_from_card(card, node)
+                card_price = prod.get("price")
+                if _normalize_price_for_key(card_price) != norm_expected:
+                    continue
+            cb = _parse_bounds(card.get("bounds") or "")
+            if cb and len(cb) >= 4:
+                x1, y1, x2, y2 = cb
+                h = y2 - y1
+                poster_y2 = y1 + int(h * 0.55)
+                cx = (x1 + x2) // 2
+                cy = (y1 + poster_y2) // 2
+                candidates.append((card, (cx, cy)))
+    if not candidates:
+        return None
+    return candidates[0][1]
+
+
+def search_in_store(u: Any, product_keyword: str) -> bool:
+    """
+    当前已在店铺内且处于「点击了右上角搜索框」后的输入页时，在店内搜索商品。
+    dump 当前页 → 解析输入框与「搜索」按钮 → 输入关键词并点击搜索。
+    成功执行搜索返回 True，未找到搜索按钮返回 False。
+    """
+    u.dump()
+    out = u.last_result
+    if not out.get("ok"):
+        return False
+    xml_str = (out.get("result") or {}).get("xml") or ""
+    in_center, btn_center = _find_in_store_search_input_and_button(xml_str)
+    if not btn_center:
+        _log("search_in_store: 未找到店内搜索按钮")
+        return False
+    search_input = {"center": in_center} if in_center else None
+    search_button = {"center": btn_center}
+    search(product_keyword, search_input=search_input, search_button=search_button)
+    return True
+
+
+def dump_products_by_list(
+    product_list: List[Dict[str, Any]],
+    *,
+    output_csv: Optional[str] = None,
+) -> dict:
+    """
+    按列表进店搜商品、进详情、分享复制链接，最后生成 banya_hotspots_YYMMDD.csv。
+    product_list 每项为 {"store": str, "product": str, "price": str}。
+    流程：1) 按 store 排序  2) 对每个 store：search_store 进店 → 点右上角搜索 → 搜 product → 点海报进详情 →
+    点分享 → 复制链接 → 记录 → 返回；重复该 store 下其余 product；再下一家 store。
+    """
+    from datetime import datetime
+    _log("dump_products_by_list: 重启拼多多，从首页开始...")
+    open_app(stop=True)
+    time.sleep(1.2)
+    u = _u()
+    win = u.window_size()
+    if not win.get("ok"):
+        return {"ok": False, "error": "window_size", "detail": str(win)}
+    w = (win.get("result") or {}).get("width") or 540
+    h = (win.get("result") or {}).get("height") or 960
+    rows: List[Dict[str, Any]] = []
+    normalized: List[Dict[str, Any]] = []
+    for item in product_list:
+        store = (item.get("store") or "").strip()
+        product = (item.get("product") or "").strip()
+        price = (item.get("price") or "").strip()
+        if not store or not product:
+            continue
+        normalized.append({"store": store, "product": product, "price": price})
+    normalized.sort(key=lambda x: (x["store"], x["product"]))
+    by_store: Dict[str, List[Dict[str, Any]]] = {}
+    for item in normalized:
+        s = item["store"]
+        if s not in by_store:
+            by_store[s] = []
+        by_store[s].append(item)
+    _log(f"dump_products: 共 {len(normalized)} 条，{len(by_store)} 家店铺")
+    first_store = True
+    for store_name, items in by_store.items():
+        _log(f"dump_products: 店铺 {store_name!r}，商品数 {len(items)}")
+        # 从第二家店起：当前在上家店铺首页，search_store 需要应用级搜索页，先多次返回回到首页
+        if not first_store:
+            _log("dump_products: 返回应用首页以便搜索下一家店铺")
+            for _ in range(4):
+                u.press("back")
+                time.sleep(0.5)
+            time.sleep(0.5)
+        first_store = False
+        out = search_store(store_name)
+        if not out.get("ok"):
+            _log(f"dump_products: search_store 失败 {out}，重启 app 后继续下一家")
+            for it in items:
+                rows.append({"store": store_name, "product": it["product"], "price": it["price"], "link": ""})
+            open_app(stop=True)
+            time.sleep(1.2)
+            continue
+        time.sleep(1.2)
+        for idx, it in enumerate(items):
+            product_keyword = it["product"]
+            price_str = it["price"]
+            _log(f"dump_products: [{store_name}] 搜索商品 {product_keyword!r}")
+            # 同一店铺内：第一个商品从店铺首页点搜索框进入；后续商品从搜索结果页返回一次到搜索输入页即可，无需回首页再点搜索
+            if idx > 0:
+                u.press("back")
+                time.sleep(0.6)
+            else:
+                u.dump()
+                out = u.last_result
+                if not out.get("ok"):
+                    rows.append({"store": store_name, "product": product_keyword, "price": price_str, "link": ""})
+                    continue
+                xml_str = (out.get("result") or {}).get("xml") or ""
+                cen = _find_store_search_box_center(xml_str, h, w)
+                if not cen:
+                    _log("dump_products: 未找到店铺内搜索框，重启 app 后继续")
+                    rows.append({"store": store_name, "product": product_keyword, "price": price_str, "link": ""})
+                    for rest in items[idx + 1 :]:
+                        rows.append({"store": store_name, "product": rest["product"], "price": rest["price"], "link": ""})
+                    open_app(stop=True)
+                    time.sleep(1.2)
+                    break
+                u.click(x=cen[0], y=cen[1])
+                time.sleep(0.8)
+            if not search_in_store(u, product_keyword):
+                rows.append({"store": store_name, "product": product_keyword, "price": price_str, "link": ""})
+                for rest in items[idx + 1 :]:
+                    rows.append({"store": store_name, "product": rest["product"], "price": rest["price"], "link": ""})
+                _log("dump_products: 店内搜索失败，重启 app 后继续下一家")
+                open_app(stop=True)
+                time.sleep(1.2)
+                break
+            time.sleep(1.2)
+            u.dump()
+            out = u.last_result
+            if not out.get("ok"):
+                rows.append({"store": store_name, "product": product_keyword, "price": price_str, "link": ""})
+                continue
+            xml_str = (out.get("result") or {}).get("xml") or ""
+            poster_cen = _find_first_product_poster_center(xml_str, product_keyword, expected_price=price_str)
+            if not poster_cen:
+                _log(f"dump_products: 未找到商品 {product_keyword!r} 卡片，重启 app 后继续下一家")
+                rows.append({"store": store_name, "product": product_keyword, "price": price_str, "link": ""})
+                for rest in items[idx + 1 :]:
+                    rows.append({"store": store_name, "product": rest["product"], "price": rest["price"], "link": ""})
+                open_app(stop=True)
+                time.sleep(1.2)
+                break
+            u.click(x=poster_cen[0], y=poster_cen[1])
+            time.sleep(1.5)
+            link = _click_share_and_copy_link_pdd(u, w, h)
+            rows.append({"store": store_name, "product": product_keyword, "price": price_str, "link": link or ""})
+            if link:
+                _log(f"dump_products: 链接长度 {len(link)}")
+            u.press("back")
+            time.sleep(0.8)
+            # 同一店铺还有下一个商品时只回到搜索结果页；最后一个商品再返回一次回到店铺首页
+            if idx >= len(items) - 1:
+                u.press("back")
+                time.sleep(0.6)
+    out_path = output_csv
+    if not out_path:
+        out_path = "banya_hotspots_" + datetime.now().strftime("%y%m%d") + ".csv"
+    if rows:
+        write_store_csv(rows, out_path)
+        _log(f"dump_products: 已写入 {out_path}，{len(rows)} 行")
+    return {"ok": True, "result": {"rows": rows, "output_csv": out_path}}
 
 
 def _group_into_products(items: List[Dict[str, Any]], limit: int) -> List[Dict[str, Any]]:

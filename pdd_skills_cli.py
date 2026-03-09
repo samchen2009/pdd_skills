@@ -4,10 +4,12 @@ PDDAgent 命令行入口：调用拼多多定制能力（open、search、dump-pr
 依赖见 requirements.txt（mobile_agent、uiautomator_android）。
 """
 import argparse
+import csv
+import io
 import json
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Dict, List
 
 # 确保仓库根在 path 中
 _repo = Path(__file__).resolve().parent.parent
@@ -17,6 +19,7 @@ if str(_repo) not in sys.path:
 from pdd_skills import (
     dump_product_detail,
     dump_products,
+    dump_products_by_list,
     dump_store_page,
     dump_stores_to_csv,
     ensure_search_page,
@@ -25,6 +28,37 @@ from pdd_skills import (
     parse_store_page_xml,
     search,
 )
+
+
+def _load_product_list_file(path: Path) -> List[Dict[str, Any]]:
+    """
+    支持 JSON 或文本文件。
+    JSON： [{"store":"x","product":"y","price":"z"}, ...]
+    文本：每行三列逗号分隔，可带引号，如 "acj","3ce","32"
+    """
+    content = path.read_text(encoding="utf-8").strip()
+    if not content:
+        return []
+    if content.startswith("["):
+        data = json.loads(content)
+        return data if isinstance(data, list) else [data]
+    rows: List[Dict[str, Any]] = []
+    for line in content.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            reader = csv.reader(io.StringIO(line))
+            row = next(reader)
+        except Exception:
+            continue
+        if len(row) >= 2:
+            rows.append({
+                "store": (row[0] or "").strip(),
+                "product": (row[1] or "").strip(),
+                "price": (row[2] or "").strip() if len(row) >= 3 else "",
+            })
+    return rows
 
 
 def main() -> int:
@@ -58,6 +92,9 @@ def main() -> int:
     p_click.add_argument("--limit", type=int, default=20, help="最多返回条数")
     p_parse = sub.add_parser("parse-store-xml", help="解析本地店铺首页 XML（无需设备）")
     p_parse.add_argument("file", help="store.xml 文件路径")
+    p_by_list = sub.add_parser("dump-products-by-list", help="按列表进店搜商品、进详情、分享复制链接，生成 banya_hotspots_YYMMDD.csv")
+    p_by_list.add_argument("list_file", help="JSON 或文本文件：JSON 为 [{\"store\",\"product\",\"price\"},...]；文本为每行三列逗号分隔，如 \"acj\",\"3ce\",\"32\"")
+    p_by_list.add_argument("--output-csv", "-o", dest="output_csv", default=None, help="输出 CSV 路径（默认 banya_hotspots_YYMMDD.csv）")
 
     args = parser.parse_args()
     use_json = args.json
@@ -79,7 +116,7 @@ def main() -> int:
     try:
         need_device = args.command in (
             "open", "ensure-search-page", "search", "dump-products", "dump-product-detail",
-            "dump-store-page", "dump-stores", "get-product-click-targets",
+            "dump-store-page", "dump-stores", "dump-products-by-list", "get-product-click-targets",
         )
         if need_device:
             from mobile_agent import init as mobile_init
@@ -133,6 +170,14 @@ def main() -> int:
         elif args.command == "parse-store-xml":
             xml_str = Path(args.file).read_text(encoding="utf-8")
             out(parse_store_page_xml(xml_str))
+        elif args.command == "dump-products-by-list":
+            list_path = Path(getattr(args, "list_file", ""))
+            list_data = _load_product_list_file(list_path)
+            result = dump_products_by_list(
+                list_data,
+                output_csv=getattr(args, "output_csv", None),
+            )
+            out(result)
     except Exception as e:
         err = {"ok": False, "error": type(e).__name__, "detail": str(e)}
         if use_json:

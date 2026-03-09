@@ -2,6 +2,12 @@
 __pycache__/
 *$py.class
 
+# Test code
+banYa_daily_monitor.sh
+*.txt
+test*.py
+
+
 # Virtual env
 .venv/
 venv/
