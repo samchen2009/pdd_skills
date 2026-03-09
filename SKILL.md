@@ -66,6 +66,9 @@ python pdd_skills/pdd_skills_cli.py ensure-search-page
 # Search
 python pdd_skills/pdd_skills_cli.py search 3CE
 
+# Dump stores
+python pdd_skills/dump-stores "3CE" "4DF" -o reports.csv
+
 # Parse products on current page (max 5)
 python pdd_skills/pdd_skills_cli.py dump-products --limit 5
 
