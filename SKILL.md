@@ -32,6 +32,7 @@ python pdd_skills/pdd_skills.py <command> [args]
 | `search KEYWORD` | Search inside the app (optional `--search-button` for button text) |
 | `dump-products` | Parse product list from current page (`--limit N`, default 10) |
 | `dump-stores STORE1 [STORE2 ...] -o FILE` | Collect multiple stores in sequence and merge into one CSV |
+| `dump-products-by-list LIST_FILE [-o CSV]` | For each row (store, product, price): search store → in-store search product → open detail → share/copy link; output CSV (default `*_YYMMDD.csv`). List: JSON `[{store,product,price}]` or text lines `store,product,price` (price optional). |
 
 ## dump-store-page full flow (when store keyword is given)
 
