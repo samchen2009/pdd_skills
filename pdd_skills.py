@@ -1234,6 +1234,47 @@ def _close_cart_popup(u: Any, screen_w: int = 540, screen_h: int = 960) -> bool:
 # 运行中干扰弹窗（如「确定放弃吗?」「先去逛逛」），与购物车弹窗区分，需点击关闭/先去逛逛
 _INTRUSIVE_POPUP_MARKERS = ("确定放弃吗?", "先去逛逛")
 
+# 底部优惠/专区条（如「专区满49减5」）盖住加购按钮，不点击，用 swipe 绕过（参考 mocks/coupon.xml）
+_BOTTOM_COUPON_PATTERN = re.compile(r"专区|满\d+减\d+", re.IGNORECASE)
+BOTTOM_ZONE_Y_RATIO = 0.85  # 屏幕高度比例，以上视为底部区域
+
+
+def _has_bottom_coupon_bar(xml_str: str, screen_h: int, package: str = PDD_PACKAGE) -> bool:
+    """
+    检测底部是否存在「专区满X减Y」类按钮（盖住购物车加号）。仅当节点在屏幕底部区域（y >= BOTTOM_ZONE_Y_RATIO * screen_h）
+    且 text/content-desc 匹配专区/满X减Y 时返回 True，避免把顶部 tab「满49减5专区」误判为底部条。
+    """
+    if not xml_str or screen_h <= 0:
+        return False
+    bottom_y_min = int(screen_h * BOTTOM_ZONE_Y_RATIO)
+    try:
+        root = ET.fromstring(xml_str)
+    except ET.ParseError:
+        return False
+    for n in root.iter():
+        pkg = (n.get("package") or "").strip()
+        if pkg and pkg != package:
+            continue
+        text = (n.get("text") or n.get("content-desc") or "").strip()
+        if not text or not _BOTTOM_COUPON_PATTERN.search(text):
+            continue
+        b = _bounds_attrs(n)
+        if len(b) < 4:
+            continue
+        # 节点在底部区域（上边 y1 进入底部即算）
+        if b[1] >= bottom_y_min:
+            return True
+    return False
+
+
+def _swipe_to_bypass_bottom_bar(u: Any, screen_w: int, screen_h: int) -> None:
+    """在列表区向上滑动，试图把底部优惠条滑走或让加号露出，避免点到「专区满X减Y」按钮。"""
+    x = screen_w // 2
+    from_y = int(screen_h * 0.75)
+    to_y = int(screen_h * 0.45)
+    u.swipe(x, from_y, x, to_y, duration=0.25)
+    time.sleep(0.4)
+
 
 def _is_intrusive_popup(xml_str: str) -> bool:
     """当前 dump 是否为干扰弹窗（非购物车弹窗）。有「确定放弃吗?」或「先去逛逛」且非购物车即视为干扰弹窗。"""
@@ -1573,6 +1614,35 @@ def _enrich_cart_remark_on_screen(
         if not plus_bounds:
             _log("购物车: [商品] 未找到卡片内「+」按钮，跳过")
             continue
+        # 底部「专区满X减Y」条盖住加号时不点击，先 swipe 绕过再重试
+        bottom_y_min = int(screen_h * BOTTOM_ZONE_Y_RATIO)
+        for _bypass in range(3):
+            if not _has_bottom_coupon_bar(fresh_xml, screen_h) or plus_bounds[1] < bottom_y_min:
+                break
+            _log("购物车: [商品] 检测到底部优惠条盖住加号，swipe 绕过")
+            _swipe_to_bypass_bottom_bar(u, screen_w, screen_h)
+            u.dump()
+            out = u.last_result
+            if not out.get("ok"):
+                break
+            fresh_xml = (out.get("result") or {}).get("xml") or ""
+            if not fresh_xml:
+                break
+            try:
+                fresh_root = ET.fromstring(fresh_xml)
+            except ET.ParseError:
+                break
+            card = _find_card_for_product(fresh_root, p)
+            if card is None:
+                break
+            plus_bounds = _find_plus_button_in_card(card)
+            if not plus_bounds:
+                break
+        if _has_bottom_coupon_bar(fresh_xml, screen_h) and plus_bounds[1] >= bottom_y_min:
+            _log("购物车: [商品] 绕过后仍被底部优惠条遮挡，跳过点击")
+            continue
+        if card is None or not plus_bounds:
+            continue
         # 点加号最右上角，避免被悬浮窗挡住
         cx = plus_bounds[2] - 2
         cy = plus_bounds[1] + 2
@@ -1636,6 +1706,35 @@ def _enrich_cart_remark_for_products(
         plus_bounds = _find_plus_button_in_card(card)
         if not plus_bounds:
             _log("购物车: [tmp商品] 未找到卡片内「+」按钮，跳过")
+            continue
+        # 底部「专区满X减Y」条盖住加号时不点击，先 swipe 绕过再重试
+        bottom_y_min = int(screen_h * BOTTOM_ZONE_Y_RATIO)
+        for _bypass in range(3):
+            if not _has_bottom_coupon_bar(fresh_xml, screen_h) or plus_bounds[1] < bottom_y_min:
+                break
+            _log("购物车: [tmp商品] 检测到底部优惠条盖住加号，swipe 绕过")
+            _swipe_to_bypass_bottom_bar(u, screen_w, screen_h)
+            u.dump()
+            out = u.last_result
+            if not out.get("ok"):
+                break
+            fresh_xml = (out.get("result") or {}).get("xml") or ""
+            if not fresh_xml:
+                break
+            try:
+                fresh_root = ET.fromstring(fresh_xml)
+            except ET.ParseError:
+                break
+            card = _find_card_for_product(fresh_root, p)
+            if card is None:
+                break
+            plus_bounds = _find_plus_button_in_card(card)
+            if not plus_bounds:
+                break
+        if _has_bottom_coupon_bar(fresh_xml, screen_h) and plus_bounds[1] >= bottom_y_min:
+            _log("购物车: [tmp商品] 绕过后仍被底部优惠条遮挡，跳过点击")
+            continue
+        if card is None or not plus_bounds:
             continue
         # 点加号最右上角，避免被悬浮窗挡住
         cx = plus_bounds[2] - 2
