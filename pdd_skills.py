@@ -2037,32 +2037,102 @@ def _find_first_product_poster_center(
     keyword = (product_keyword or "").strip()
     if not keyword:
         return None
-    # 标题匹配时统一全角＃与半角#，避免列表与页面不一致导致匹配失败
+    # 标题匹配：统一符号并做模糊匹配（避免“眼影/猫影”这类轻微差异导致漏匹配）
     def _norm_title(s: str) -> str:
         return (s or "").replace("\uff03", "#")  # fullwidth # -> #
+
+    def _clean_for_match(s: str) -> str:
+        s = _norm_title((s or "").lower())
+        # 去掉空白和常见分隔符，提升“标题 vs 关键词”的可比性
+        return re.sub(r"[\s#\-\|·•,，。!！?？:：;；'\"`~【】\[\]\(\)（）/\\_]+", "", s)
+
+    def _bigrams(s: str) -> Set[str]:
+        if not s:
+            return set()
+        if len(s) < 2:
+            return {s}
+        return {s[i : i + 2] for i in range(len(s) - 1)}
+
+    def _title_match_score(k: str, txt: str) -> float:
+        """返回 0~1 匹配分：包含命中优先，否则走 2-gram 重叠 + token 命中。"""
+        k_clean = _clean_for_match(k)
+        t_clean = _clean_for_match(txt)
+        if not k_clean or not t_clean:
+            return 0.0
+        if k_clean in t_clean or t_clean in k_clean:
+            return 1.0
+        k2 = _bigrams(k_clean)
+        if not k2:
+            return 0.0
+        t2 = _bigrams(t_clean)
+        overlap = len(k2 & t2) / max(1, len(k2))
+        # token 补充：按空格切词后，命中比例越高分越高
+        raw_tokens = [x for x in re.split(r"\s+", k) if x]
+        tokens = [_clean_for_match(x) for x in raw_tokens if _clean_for_match(x)]
+        long_tokens = [x for x in tokens if len(x) >= 2]
+        token_hit = 0
+        for tk in long_tokens:
+            if tk in t_clean:
+                token_hit += 1
+        token_score = (token_hit / len(long_tokens)) if long_tokens else 0.0
+        return max(overlap, token_score * 0.9)
     keyword_norm = _norm_title(keyword)
     norm_expected = _normalize_price_for_key(expected_price) if expected_price else None
+    _log(
+        "match_product: 开始匹配 "
+        f"keyword={keyword!r} -> norm={keyword_norm!r}, "
+        f"expected_price={expected_price!r} -> norm={norm_expected!r}"
+    )
+    # 打印搜索结果商品预览，便于定位为何没匹配上
+    try:
+        page_preview = parse_store_page_xml(xml_str)
+        preview_products = page_preview.get("products") or []
+        if preview_products:
+            preview_lines: List[str] = []
+            for i, p in enumerate(preview_products[:8]):
+                t = (p.get("title") or p.get("title_short") or "")[:40]
+                pr = p.get("price")
+                tg = ",".join((p.get("tags") or [])[:2])
+                preview_lines.append(f"#{i+1} title={t!r} price={pr!r} tags={tg!r}")
+            _log(f"match_product: 搜索结果商品预览({len(preview_products)}条，最多展示8条): {preview_lines}")
+        else:
+            _log("match_product: 搜索结果商品预览为空（parse_store_page_xml 未解析到商品）")
+    except Exception as e:
+        _log(f"match_product: 搜索结果商品预览解析异常: {e}")
     title_rid = TITLE_RID
     candidates: List[Tuple[ET.Element, Tuple[int, int]]] = []
+    title_nodes_total = 0
+    title_hits = 0
+    price_mismatch_samples: List[str] = []
+    no_card_samples: List[str] = []
+    matched_title_samples: List[str] = []
+    title_nonmatch_samples: List[str] = []
     for node in root.iter():
         if node.get("package") != package:
             continue
         rid = (node.get("resource-id") or "").strip()
         if rid != title_rid:
             continue
+        title_nodes_total += 1
         t = (node.get("text") or "").strip()
         d = (node.get("content-desc") or "").strip()
         # 列表里是完整商品名，搜索结果里 text 常被截断，完整标题可能在 content-desc
         title_candidates = [x for x in (t, d) if x]
         if not title_candidates:
             continue
-        def _title_matches(k: str, txt: str) -> bool:
-            k, txt = _norm_title(k), _norm_title(txt)
-            if k in txt:
-                return True
-            return txt in k and len(txt) >= 6
-        if not any(_title_matches(keyword_norm, txt) for txt in title_candidates):
+        best_score = 0.0
+        for txt in title_candidates:
+            score = _title_match_score(keyword_norm, txt)
+            if score > best_score:
+                best_score = score
+        # 经验阈值：0.45 可覆盖轻微错字/符号差异，避免过宽误匹配
+        if best_score < 0.45:
+            if len(title_nonmatch_samples) < 8:
+                title_nonmatch_samples.append(f"{(d or t)[:60]!r}(score={best_score:.2f})")
             continue
+        title_hits += 1
+        if len(matched_title_samples) < 5:
+            matched_title_samples.append(f"{(d or t)[:60]!r}(score={best_score:.2f})")
         title_b = _parse_bounds(node.get("bounds") or "")
         if not title_b or len(title_b) < 4:
             continue
@@ -2093,6 +2163,10 @@ def _find_first_product_poster_center(
                 prod = _extract_product_from_card(card, node)
                 card_price = prod.get("price")
                 if _normalize_price_for_key(card_price) != norm_expected:
+                    if len(price_mismatch_samples) < 5:
+                        price_mismatch_samples.append(
+                            f"title={(prod.get('title') or '')[:28]!r}, card_price={card_price!r}"
+                        )
                     continue
             cb = _parse_bounds(card.get("bounds") or "")
             if cb and len(cb) >= 4:
@@ -2102,8 +2176,38 @@ def _find_first_product_poster_center(
                 cx = (x1 + x2) // 2
                 cy = (y1 + poster_y2) // 2
                 candidates.append((card, (cx, cy)))
+        else:
+            if len(no_card_samples) < 5:
+                no_card_samples.append((d or t)[:80])
+    _log(
+        "match_product: 标题节点总数="
+        f"{title_nodes_total}, 标题命中={title_hits}, "
+        f"坐标候选={len(candidates)}"
+    )
+    if matched_title_samples:
+        _log(f"match_product: 标题命中样例={matched_title_samples}")
+    if no_card_samples:
+        _log(f"match_product: 标题命中但未找到卡片样例={no_card_samples}")
+    if price_mismatch_samples:
+        _log(f"match_product: 价格不匹配样例={price_mismatch_samples}")
+    if title_nonmatch_samples:
+        _log(f"match_product: 标题未命中样例={title_nonmatch_samples}")
     if not candidates:
+        # 明确失败原因，便于快速定位
+        fail_reasons: List[str] = []
+        if title_nodes_total == 0:
+            fail_reasons.append("页面未识别到商品标题节点(TITLE_RID)")
+        if title_nodes_total > 0 and title_hits == 0:
+            fail_reasons.append("商品标题匹配失败(keyword 与标题不匹配)")
+        if title_hits > 0 and no_card_samples:
+            fail_reasons.append("标题命中但卡片容器识别失败")
+        if title_hits > 0 and norm_expected is not None and price_mismatch_samples:
+            fail_reasons.append("标题命中但价格过滤不通过(expected_price 不一致)")
+        if not fail_reasons:
+            fail_reasons.append("未命中坐标（可能页面结构变化）")
+        _log(f"match_product: 未匹配到可点击商品海报坐标，失败原因={fail_reasons}")
         return None
+    _log(f"match_product: 命中坐标={candidates[0][1]}")
     return candidates[0][1]
 
 
