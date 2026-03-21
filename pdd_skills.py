@@ -732,6 +732,7 @@ def scroll_store_to_end(
     no_dedup: bool = False,
     max_cart_scrolls: int = 2,
     max_products_scrolls: Optional[int] = None,
+    use_detail_flow: bool = False,
 ) -> dict:
     """
     当前页为店铺首页时，逐屏下滑并合并（只合入有价商品，按 title+价格 去重）：
@@ -801,7 +802,10 @@ def scroll_store_to_end(
 
         tmp = merge_products(parsed_in_last_screen, parsed_in_current_screen)
         if tmp:
-            _enrich_cart_remark_for_products(u, tmp, w, h, max_cart_scrolls=max_cart_scrolls)
+            if use_detail_flow:
+                _enrich_products_via_detail_flow(u, tmp, w, h, max_cart_scrolls=max_cart_scrolls)
+            else:
+                _enrich_cart_remark_for_products(u, tmp, w, h, max_cart_scrolls=max_cart_scrolls)
         parsed_list.append(tmp)
         for j, p in enumerate(tmp):
             tit = (p.get("title_short") or p.get("title") or "").strip()[:40]
@@ -1366,6 +1370,25 @@ def _dismiss_intrusive_popup(u: Any, screen_w: int, screen_h: int) -> bool:
     return True
 
 
+def _dismiss_intrusive_popups_if_present(
+    u: Any, screen_w: int, screen_h: int, max_tries: int = 3
+) -> bool:
+    """若当前存在干扰弹窗，循环关闭后再返回。"""
+    dismissed_any = False
+    for _ in range(max_tries):
+        u.dump()
+        out = u.last_result
+        if not out.get("ok"):
+            break
+        xml_str = (out.get("result") or {}).get("xml") or ""
+        if not _is_intrusive_popup(xml_str):
+            break
+        dismissed_any = True
+        _dismiss_intrusive_popup(u, screen_w, screen_h)
+        time.sleep(0.4)
+    return dismissed_any
+
+
 def _find_scrollable_spec_recycler_bounds(
     xml_str: str, package: str = PDD_PACKAGE
 ) -> Optional[Tuple[Tuple[int, int, int, int], str]]:
@@ -1765,6 +1788,7 @@ def to_csv_rows(store: Dict[str, Any], products: List[Dict[str, Any]]) -> List[D
             "price": p.get("price"),
             "sales": p.get("sales"),
             "tags": tags_str,
+            "link": (p.get("link") or "").strip(),
             "缺货标志": _out_of_stock_flag(tag_list),
             "仅剩": _extract_only_left(p),
             "备注": (p.get("备注") or "").strip(),
@@ -1800,43 +1824,170 @@ def _get_clipboard_pdd(u: Any) -> str:
     return ""
 
 
+def _node_click_debug(
+    *,
+    stage: str,
+    center: Optional[Tuple[int, int]] = None,
+    bounds: Optional[Tuple[int, int, int, int]] = None,
+    node_class: str = "",
+    text: str = "",
+    content_desc: str = "",
+    clickable: Optional[bool] = None,
+    score: Optional[int] = None,
+    extra: str = "",
+) -> None:
+    """打印点击目标的详细信息，便于定位误点。"""
+    fields = [f"stage={stage}"]
+    if center:
+        fields.append(f"center={center}")
+    if bounds:
+        fields.append(f"bounds={bounds}")
+    if node_class:
+        fields.append(f"class={node_class}")
+    if text:
+        fields.append(f"text={text[:40]!r}")
+    if content_desc:
+        fields.append(f"desc={content_desc[:60]!r}")
+    if clickable is not None:
+        fields.append(f"clickable={clickable}")
+    if score is not None:
+        fields.append(f"score={score}")
+    if extra:
+        fields.append(extra)
+    _log("click_debug: " + ", ".join(fields))
+
+
+def _is_share_panel_open_xml(xml_str: str, screen_h: int) -> bool:
+    """
+    判断是否已打开分享面板（避免把详情页顶部「分享到拼小圈」误判为分享浮层）。
+    规则：在屏幕中下部出现至少 2 个分享面板选项（如 复制链接/微信/QQ/朋友圈/更多）才算打开。
+    """
+    if not xml_str:
+        return False
+    try:
+        root = ET.fromstring(xml_str)
+    except ET.ParseError:
+        return False
+    bottom_min_y = int(screen_h * 0.45)
+    option_hits: Set[str] = set()
+    for n in root.iter():
+        t = (n.get("text") or "").strip()
+        d = (n.get("content-desc") or "").strip()
+        shown = t or d
+        if not shown:
+            continue
+        b = _parse_bounds(n.get("bounds") or "")
+        if not b or len(b) < 4:
+            continue
+        if b[1] < bottom_min_y:
+            continue
+        if "复制链接" in shown:
+            option_hits.add("复制链接")
+        elif shown in ("微信", "QQ", "朋友圈", "更多", "复制"):
+            option_hits.add(shown)
+        elif ("微信" in shown) or ("QQ" in shown) or ("朋友圈" in shown):
+            option_hits.add("social")
+    return len(option_hits) >= 2
+
+
 def _click_share_and_copy_link_pdd(u: Any, screen_w: int, screen_h: int) -> str:
     """
     当前在商品详情页：点击右上角分享 → 在下方浮层中找「复制链接」并点击（必要时右滑），再读剪贴板。
     返回链接字符串，失败返回空。
     """
-    u.dump()
-    out = u.last_result
-    if not out.get("ok"):
-        return ""
-    xml_str = (out.get("result") or {}).get("xml") or ""
-    try:
-        root = ET.fromstring(xml_str)
-    except ET.ParseError:
-        return ""
-    # 右上角分享：content-desc="分享" 且位置在右上方
+    _dismiss_intrusive_popups_if_present(u, screen_w, screen_h)
+    # 进入详情后可能仍在过渡动画，给分享按钮 3 次识别机会
     share_center: Optional[Tuple[int, int]] = None
-    for n in root.iter():
-        if n.get("package") != PDD_PACKAGE:
+    share_meta: Dict[str, Any] = {}
+    for _ in range(3):
+        u.dump()
+        out = u.last_result
+        if not out.get("ok"):
+            time.sleep(0.35)
             continue
-        if (n.get("clickable") or "").strip() != "true":
+        xml_str = (out.get("result") or {}).get("xml") or ""
+        try:
+            root = ET.fromstring(xml_str)
+        except ET.ParseError:
+            time.sleep(0.35)
             continue
-        desc = (n.get("content-desc") or "").strip()
-        if desc != "分享":
-            continue
-        b = _parse_bounds(n.get("bounds") or "")
-        if not b or len(b) < 4:
-            continue
-        if b[2] < screen_w * 0.8 or b[1] > screen_h * 0.2:
-            continue
-        share_center = ((b[0] + b[2]) // 2, (b[1] + b[3]) // 2)
-        break
+        # 按 product1/2/3.xml：顶部工具栏内，content-desc="分享" 的 FrameLayout，bounds 约 [951,95][1066,228]
+        # 先严格命中，再做轻量回退。
+        best_score = -10**9
+        for n in root.iter():
+            if n.get("package") != PDD_PACKAGE:
+                continue
+            clickable = (n.get("clickable") or "").strip() == "true"
+            desc = (n.get("content-desc") or "").strip()
+            text = (n.get("text") or "").strip()
+            if desc != "分享" and ("分享" not in desc and "分享" not in text):
+                continue
+            b = _parse_bounds(n.get("bounds") or "")
+            if not b or len(b) < 4:
+                continue
+            # 顶栏右上角：y 在上部工具栏，x 在右侧
+            if b[1] > int(screen_h * 0.15) or b[2] < int(screen_w * 0.85):
+                continue
+            cx, cy = (b[0] + b[2]) // 2, (b[1] + b[3]) // 2
+            score = cx * 10 - cy * 3 + (120 if desc == "分享" else 0) + (50 if clickable else 0)
+            if score > best_score:
+                best_score = score
+                share_center = (cx, cy)
+                share_meta = {
+                    "bounds": b,
+                    "class": (n.get("class") or "").strip(),
+                    "text": text,
+                    "desc": desc,
+                    "clickable": clickable,
+                    "score": score,
+                }
+        if share_center:
+            break
+        time.sleep(0.35)
+    fallback = (int(screen_w * 0.935), int(screen_h * 0.067))
     if not share_center:
-        _log("banya_hotspots: 未找到详情页分享图标")
+        # 回退：直接点右上分享固定区中心（product*.xml 约 [951,95][1066,228]）
+        _node_click_debug(stage="share_fallback", center=fallback, extra="reason=no_share_node")
+        _log(f"banya_hotspots: 未精确识别分享图标，回退点击右上角 {fallback}")
+        u.click(x=fallback[0], y=fallback[1])
+    else:
+        _node_click_debug(
+            stage="share",
+            center=share_center,
+            bounds=share_meta.get("bounds"),
+            node_class=share_meta.get("class", ""),
+            text=share_meta.get("text", ""),
+            content_desc=share_meta.get("desc", ""),
+            clickable=share_meta.get("clickable"),
+            score=share_meta.get("score"),
+        )
+        _log("banya_hotspots: 点击分享")
+        u.click(x=share_center[0], y=share_center[1])
+    time.sleep(0.8)
+    # 点击后验收：若分享面板未拉起，自动重试（同点位 + 轻微偏移 + 回退点）
+    panel_open = False
+    for retry_idx in range(4):
+        u.dump()
+        out = u.last_result
+        if out.get("ok"):
+            xml_now = (out.get("result") or {}).get("xml") or ""
+            panel_open_now = _is_share_panel_open_xml(xml_now, screen_h)
+            _log(f"click_debug: stage=share_panel_check, retry_idx={retry_idx}, open={panel_open_now}")
+            if panel_open_now:
+                panel_open = True
+                break
+        _dismiss_intrusive_popups_if_present(u, screen_w, screen_h)
+        base = share_center or fallback
+        if not base:
+            base = fallback
+        offset = [(0, 0), (-18, 0), (18, 0), (0, 18)][retry_idx]
+        retry_pt = (base[0] + offset[0], base[1] + offset[1])
+        _node_click_debug(stage="share_retry", center=retry_pt, extra=f"retry_idx={retry_idx}")
+        u.click(x=retry_pt[0], y=retry_pt[1])
+        time.sleep(0.7)
+    if not panel_open:
+        _log("banya_hotspots: 点击分享后未拉起分享面板，返回空链接")
         return ""
-    _log("banya_hotspots: 点击分享")
-    u.click(x=share_center[0], y=share_center[1])
-    time.sleep(1.0)
     # 浮层中找「复制链接」，可能需右滑
     for swipe_attempt in range(3):
         u.dump()
@@ -1848,26 +1999,369 @@ def _click_share_and_copy_link_pdd(u: Any, screen_w: int, screen_h: int) -> str:
             root = ET.fromstring(xml_str)
         except ET.ParseError:
             break
+        option_preview: List[str] = []
+        copied = False
         for n in root.iter():
             t = (n.get("text") or "").strip()
             desc = (n.get("content-desc") or "").strip()
-            if t != "复制链接" and desc != "复制链接":
+            shown = t or desc
+            if shown and len(option_preview) < 8:
+                option_preview.append(shown[:20])
+            # 兼容不同文案：复制链接 / 复制 / 链接
+            is_copy_link = (
+                (t == "复制链接" or desc == "复制链接")
+                or ("复制链接" in t or "复制链接" in desc)
+                or (("复制" in t or "复制" in desc) and ("链接" in t or "链接" in desc))
+                or (t == "复制" or desc == "复制")
+            )
+            if not is_copy_link:
                 continue
             b = _parse_bounds(n.get("bounds") or "")
             if not b or len(b) < 4:
                 continue
             cx, cy = (b[0] + b[2]) // 2, (b[1] + b[3]) // 2
+            _node_click_debug(
+                stage="copy_link",
+                center=(cx, cy),
+                bounds=b,
+                node_class=(n.get("class") or "").strip(),
+                text=t,
+                content_desc=desc,
+                clickable=((n.get("clickable") or "").strip() == "true"),
+            )
             _log("banya_hotspots: 点击复制链接")
             u.click(x=cx, y=cy)
             time.sleep(0.8)
             link = _get_clipboard_pdd(u)
             if link and "no shell command" not in link.lower() and "inaccessible" not in link.lower():
                 return link.strip()
-            return ""
+            copied = True
+        _log(
+            "click_debug: stage=copy_link_panel_scan, "
+            f"swipe_attempt={swipe_attempt}, found_copy_node={copied}, "
+            f"options={option_preview}"
+        )
         # 未找到则右滑浮层再试
         u.swipe(int(screen_w * 0.7), int(screen_h * 0.7), int(screen_w * 0.3), int(screen_h * 0.7), duration=0.2)
         time.sleep(0.5)
     return ""
+
+
+def _dismiss_share_panel_if_present(u: Any, screen_h: int) -> None:
+    """若当前仍在分享浮层（可见「复制链接」），按一次 back 关闭。"""
+    u.dump()
+    out = u.last_result
+    if not out.get("ok"):
+        return
+    xml_str = (out.get("result") or {}).get("xml") or ""
+    if _is_share_panel_open_xml(xml_str, screen_h):
+        _log("click_debug: stage=dismiss_share_panel, action=back")
+        u.press("back")
+        time.sleep(0.5)
+
+
+def _open_cart_from_detail(u: Any, screen_w: int, screen_h: int) -> bool:
+    """
+    当前在商品详情页时，尝试点击右下角进入购物车/加购规格区。
+    优先点击底部右侧带「购物车/加入购物车/选规格」语义的可点击节点；否则回退到右下角坐标。
+    """
+    _dismiss_intrusive_popups_if_present(u, screen_w, screen_h)
+    u.dump()
+    out = u.last_result
+    if not out.get("ok"):
+        return False
+    xml_str = (out.get("result") or {}).get("xml") or ""
+    try:
+        root = ET.fromstring(xml_str)
+    except ET.ParseError:
+        return False
+    # 按 product1/2/3.xml：底部购买区固定在 y=[2198,2354]，右侧 x=[388,1080]。
+    # 优先找该区域内的 clickable ViewGroup（content-desc 常含“¥xx单独购买/免拼购买/团专享”，也可能仅“¥76”）。
+    best_center: Optional[Tuple[int, int]] = None
+    best_meta: Dict[str, Any] = {}
+    best_score = -1
+    candidates: List[Dict[str, Any]] = []
+    right_min_x = int(screen_w * 0.35)
+    bottom_min_y = int(screen_h * 0.9)
+    for n in root.iter():
+        if n.get("package") != PDD_PACKAGE:
+            continue
+        if n.get("class") != "android.view.ViewGroup":
+            continue
+        if (n.get("clickable") or "").strip() != "true":
+            continue
+        b = _parse_bounds(n.get("bounds") or "")
+        if not b or len(b) < 4:
+            continue
+        x1, y1, x2, y2 = b
+        # 必须命中右下购买区
+        if x1 < right_min_x or y1 < bottom_min_y:
+            continue
+        cx, cy = (b[0] + b[2]) // 2, (b[1] + b[3]) // 2
+        desc = (n.get("content-desc") or "").strip()
+        bw, bh = x2 - x1, y2 - y1
+        area = bw * bh
+        if area < int(screen_w * screen_h * 0.005):
+            continue
+        # 语义优先，但 product1 可能只有“¥76”，所以只要含价格也算
+        has_price = bool(re.search(r"¥\s*\d+(\.\d+)?", desc))
+        has_buy_word = ("购买" in desc) or ("免拼" in desc) or ("专享" in desc)
+        # 过滤“直接成团”这类非底部购买主按钮候选
+        if ("成团" in desc) and not has_buy_word:
+            continue
+        if not has_price:
+            continue
+        # 在候选容器内部再找更精确的“购买语义子节点”点击点（如“仅剩8件 免拼购买”）
+        sub_click_center: Optional[Tuple[int, int]] = None
+        sub_click_bounds: Optional[Tuple[int, int, int, int]] = None
+        sub_click_text = ""
+        sub_click_score = -1
+        for child in n.iter():
+            ct = (child.get("text") or "").strip()
+            cd = (child.get("content-desc") or "").strip()
+            if not ct and not cd:
+                continue
+            cb = _parse_bounds(child.get("bounds") or "")
+            if not cb or len(cb) < 4:
+                continue
+            # 子节点需在候选容器内
+            if not (cb[0] >= x1 and cb[1] >= y1 and cb[2] <= x2 and cb[3] <= y2):
+                continue
+            txt = ct or cd
+            if ("购买" not in txt) and ("免拼" not in txt) and ("团专享" not in txt) and ("仅剩" not in txt):
+                continue
+            ccx, ccy = (cb[0] + cb[2]) // 2, (cb[1] + cb[3]) // 2
+            s = ccx * 10 + ccy  # 越靠右下越优先
+            if s > sub_click_score:
+                sub_click_score = s
+                sub_click_center = (ccx, ccy)
+                sub_click_bounds = cb
+                sub_click_text = txt
+        final_center = sub_click_center or (cx, cy)
+        score = 0
+        if has_price:
+            score += 40
+        if has_buy_word:
+            score += 30
+        # 多按钮时优先点更右侧（通常右侧是主要购买按钮）
+        score += final_center[0] // 10
+        if sub_click_center:
+            score += 25
+        candidates.append({
+            "center": final_center,
+            "bounds": b,
+            "class": (n.get("class") or "").strip(),
+            "text": (n.get("text") or "").strip(),
+            "desc": desc,
+            "clickable": True,
+            "score": score,
+            "extra": (
+                f"has_price={has_price},has_buy_word={has_buy_word},area={area},"
+                f"sub_click_text={sub_click_text!r},sub_click_bounds={sub_click_bounds},"
+                f"source={'sub_node' if sub_click_center else 'container_center'}"
+            ),
+        })
+        if score > best_score:
+            best_score = score
+            best_center = final_center
+            best_meta = {
+                "bounds": b,
+                "class": (n.get("class") or "").strip(),
+                "text": (n.get("text") or "").strip(),
+                "desc": desc,
+                "clickable": True,
+                "score": score,
+                "extra": (
+                    f"has_price={has_price},has_buy_word={has_buy_word},area={area},"
+                    f"sub_click_text={sub_click_text!r},sub_click_bounds={sub_click_bounds},"
+                    f"source={'sub_node' if sub_click_center else 'container_center'}"
+                ),
+            }
+    if candidates:
+        top3 = sorted(candidates, key=lambda x: x.get("score", 0), reverse=True)[:3]
+        for i, c in enumerate(top3, start=1):
+            _node_click_debug(
+                stage=f"open_cart_candidate_top{i}",
+                center=c.get("center"),
+                bounds=c.get("bounds"),
+                node_class=c.get("class", ""),
+                text=c.get("text", ""),
+                content_desc=c.get("desc", ""),
+                clickable=c.get("clickable"),
+                score=c.get("score"),
+                extra=c.get("extra", ""),
+            )
+    else:
+        _log("click_debug: stage=open_cart_candidates, none")
+    if best_center:
+        _node_click_debug(
+            stage="open_cart",
+            center=best_center,
+            bounds=best_meta.get("bounds"),
+            node_class=best_meta.get("class", ""),
+            text=best_meta.get("text", ""),
+            content_desc=best_meta.get("desc", ""),
+            clickable=best_meta.get("clickable"),
+            score=best_meta.get("score"),
+            extra=best_meta.get("extra", ""),
+        )
+        _log(f"详情页: 点击右下角入口 {best_center}")
+        u.click(x=best_center[0], y=best_center[1])
+        time.sleep(1.0)
+        return True
+    # 回退：购买区中心（与 product*.xml 区域一致）
+    fallback = (int(screen_w * 0.68), int(screen_h * 0.95))
+    _node_click_debug(stage="open_cart_fallback", center=fallback, extra="reason=no_bottom_buy_node")
+    _log(f"详情页: 未识别到右下入口，最终回退点击 {fallback}")
+    u.click(x=fallback[0], y=fallback[1])
+    time.sleep(1.0)
+    return True
+
+
+def _center_from_xml_node_id(xml_node_id: str) -> Optional[Tuple[int, int]]:
+    b = _parse_bounds((xml_node_id or "").strip())
+    if not b or len(b) < 4:
+        return None
+    return ((b[0] + b[2]) // 2, (b[1] + b[3]) // 2)
+
+
+def _is_product_detail_page_xml(xml_str: str, screen_h: int) -> bool:
+    """
+    判断当前 XML 是否为商品详情页（用于避免在详情页误做“商品列表重定位”）。
+    依据 product1~4.xml：顶部有「分享」，底部有「店铺/收藏/客服」工具栏。
+    """
+    if not xml_str:
+        return False
+    try:
+        root = ET.fromstring(xml_str)
+    except ET.ParseError:
+        return False
+    has_share_top = False
+    has_bottom_actions = False
+    bottom_y_min = int(screen_h * 0.85)
+    for n in root.iter():
+        if n.get("package") != PDD_PACKAGE:
+            continue
+        desc = (n.get("content-desc") or "").strip()
+        b = _parse_bounds(n.get("bounds") or "")
+        if not b or len(b) < 4:
+            continue
+        if desc == "分享" and b[1] <= int(screen_h * 0.2):
+            has_share_top = True
+        if desc in ("店铺", "收藏", "客服") and b[1] >= bottom_y_min:
+            has_bottom_actions = True
+        if has_share_top and has_bottom_actions:
+            return True
+    return False
+
+
+def _ensure_on_product_list_page(
+    u: Any, screen_w: int, screen_h: int, max_back: int = 3
+) -> bool:
+    """
+    若当前仍在详情页，自动 back 回到商品列表页。返回 True 表示已不在详情页。
+    """
+    for _ in range(max_back):
+        _dismiss_intrusive_popups_if_present(u, screen_w, screen_h)
+        u.dump()
+        out = u.last_result
+        if not out.get("ok"):
+            return False
+        xml_str = (out.get("result") or {}).get("xml") or ""
+        if not _is_product_detail_page_xml(xml_str, screen_h):
+            return True
+        u.press("back")
+        time.sleep(0.8)
+    u.dump()
+    out = u.last_result
+    if not out.get("ok"):
+        return False
+    xml_str = (out.get("result") or {}).get("xml") or ""
+    return not _is_product_detail_page_xml(xml_str, screen_h)
+
+
+def _find_product_center_on_current_screen(
+    u: Any, prod: Dict[str, Any], screen_h: int
+) -> Optional[Tuple[int, int]]:
+    """
+    在当前列表页重新匹配目标商品坐标，减少因回退后列表轻微位移导致点偏。
+    优先按 name+price 匹配，失败时回退 xml_node_id 坐标。
+    """
+    u.dump()
+    out = u.last_result
+    if not out.get("ok"):
+        return _center_from_xml_node_id((prod.get("xml_node_id") or "").strip())
+    xml_str = (out.get("result") or {}).get("xml") or ""
+    if not xml_str:
+        return _center_from_xml_node_id((prod.get("xml_node_id") or "").strip())
+    # 仍在详情页时不要解析“店铺商品列表”，否则会误点到详情内可点击模块（如“参与可直接成团”）
+    if _is_product_detail_page_xml(xml_str, screen_h=screen_h):
+        return None
+    parsed = parse_store_page_xml(xml_str)
+    current_products = parsed.get("products") or []
+    for cp in current_products:
+        if _same_product_by_name_price(prod, cp):
+            cen = _center_from_xml_node_id((cp.get("xml_node_id") or "").strip())
+            if cen:
+                return cen
+    return _center_from_xml_node_id((prod.get("xml_node_id") or "").strip())
+
+
+def _enrich_products_via_detail_flow(
+    u: Any,
+    products: List[Dict[str, Any]],
+    screen_w: int,
+    screen_h: int,
+    max_cart_scrolls: int = 2,
+) -> None:
+    """
+    对当前屏新增商品逐个执行详情流程：
+    1) 点击商品进详情；2) 分享并复制链接；3) 点右下角进购物车/规格区；
+    4) 解析「最后X件」明细写入备注；最后返回商品列表页。
+    """
+    for p in products:
+        if not _ensure_on_product_list_page(u, screen_w, screen_h):
+            _log("详情流程: 未能回到商品列表页，跳过当前商品")
+            continue
+        center = _find_product_center_on_current_screen(u, p, screen_h)
+        if not center:
+            _log("详情流程: 当前不在商品列表页或未匹配到商品中心，跳过")
+            continue
+        title_short = (p.get("title_short") or p.get("title") or "").strip()[:30]
+        _node_click_debug(
+            stage="open_product",
+            center=center,
+            bounds=_parse_bounds((p.get("xml_node_id") or "").strip() or ""),
+            text=title_short,
+            content_desc=(p.get("title") or "").strip(),
+            extra=f"price={p.get('price')!r}",
+        )
+        _log(f"详情流程: 打开商品 {title_short!r}")
+        u.click(x=center[0], y=center[1])
+        time.sleep(1.2)
+        _dismiss_intrusive_popups_if_present(u, screen_w, screen_h)
+
+        link = _click_share_and_copy_link_pdd(u, screen_w, screen_h)
+        p["link"] = link or ""
+        if link:
+            _log(f"详情流程: 已复制链接，长度={len(link)}")
+        _dismiss_share_panel_if_present(u, screen_h)
+        _dismiss_intrusive_popups_if_present(u, screen_w, screen_h)
+
+        remark = ""
+        if _open_cart_from_detail(u, screen_w, screen_h):
+            remark = _collect_cart_remark_with_scroll(u, screen_w, screen_h, max_scrolls=max_cart_scrolls)
+            if remark:
+                _log(f"详情流程: 缺货明细 {remark[:60]!r}")
+            # 返回详情页（购物车弹窗/页）
+            u.press("back")
+            time.sleep(0.6)
+        p["备注"] = remark or ""
+
+        # 返回商品列表页
+        u.press("back")
+        time.sleep(1.0)
+        _ensure_on_product_list_page(u, screen_w, screen_h)
 
 
 def _bounds_contain(outer: Optional[Tuple[int, int, int, int]], inner: Optional[Tuple[int, int, int, int]]) -> bool:
@@ -2232,6 +2726,105 @@ def search_in_store(u: Any, product_keyword: str) -> bool:
     return True
 
 
+def _find_product_poster_center_with_scroll(
+    u: Any,
+    product_keyword: str,
+    expected_price: Optional[str],
+    screen_w: int,
+    screen_h: int,
+    max_scrolls: int = 10,
+) -> Optional[Tuple[int, int]]:
+    """
+    在店内搜索结果页查找商品卡海报坐标；若当前屏未命中则持续下滑继续查找。
+    通过页面签名重复判定“基本到底”，避免只看首屏导致漏匹配。
+    """
+    seen_signatures: Set[str] = set()
+    repeated_signature_count = 0
+    for i in range(max_scrolls + 1):
+        u.dump()
+        out = u.last_result
+        if not out.get("ok"):
+            _log(f"match_product_scroll: dump 失败，停止 (round={i+1})")
+            return None
+        xml_str = (out.get("result") or {}).get("xml") or ""
+        if not xml_str:
+            _log(f"match_product_scroll: 无 xml，停止 (round={i+1})")
+            return None
+
+        # 若命中“搜索无商品结果页”，直接返回，不再继续下滑
+        if _is_no_product_search_result(xml_str):
+            _log("match_product_scroll: 命中无商品结果页（没有更多商品了/其他店铺精选推荐），直接返回未找到")
+            return None
+
+        # 每一屏都尝试匹配一次
+        cen = _find_first_product_poster_center(xml_str, product_keyword, expected_price=expected_price)
+        if cen:
+            _log(f"match_product_scroll: 第 {i+1} 屏命中坐标 {cen}")
+            return cen
+
+        # 页面签名：前几条标题+价格，若连续重复，认为到底
+        try:
+            parsed = parse_store_page_xml(xml_str)
+            products = parsed.get("products") or []
+            sig_parts: List[str] = []
+            for p in products[:6]:
+                t = (p.get("title_short") or p.get("title") or "")[:20]
+                pr = str(p.get("price") or "")
+                sig_parts.append(f"{t}|{pr}")
+            signature = "||".join(sig_parts)
+        except Exception:
+            signature = ""
+
+        if signature and signature in seen_signatures:
+            repeated_signature_count += 1
+            _log(f"match_product_scroll: 页面签名重复({repeated_signature_count})，继续尝试")
+        else:
+            if signature:
+                seen_signatures.add(signature)
+            repeated_signature_count = 0
+
+        if i >= max_scrolls:
+            break
+        if repeated_signature_count >= 2:
+            _log("match_product_scroll: 连续重复页面，判定已到底")
+            break
+
+        # 下滑到下一屏（小幅，减少跳过）
+        u.swipe(screen_w // 2, int(screen_h * 0.72), screen_w // 2, int(screen_h * 0.33), duration=0.25)
+        time.sleep(1.0)
+    _log("match_product_scroll: 多屏查找后仍未命中")
+    return None
+
+
+def _is_no_product_search_result(xml_str: str, package: str = PDD_PACKAGE) -> bool:
+    """
+    判断是否为“店内搜索无商品”结果页（参考 mocks/no_product.xml）。
+    特征文案：
+    - 没有更多商品了
+    - 其他店铺精选推荐
+    两者同时出现时判定更可靠，避免误伤普通列表页。
+    """
+    try:
+        root = ET.fromstring(xml_str)
+    except ET.ParseError:
+        return False
+    has_no_more = False
+    has_other_store_reco = False
+    for n in root.iter():
+        if n.get("package") != package:
+            continue
+        t = (n.get("text") or "").strip()
+        if not t:
+            continue
+        if t == "没有更多商品了":
+            has_no_more = True
+        elif "其他店铺精选推荐" in t:
+            has_other_store_reco = True
+        if has_no_more and has_other_store_reco:
+            return True
+    return False
+
+
 def dump_products_by_list(
     product_list: List[Dict[str, Any]],
     *,
@@ -2270,6 +2863,7 @@ def dump_products_by_list(
             by_store[s] = []
         by_store[s].append(item)
     _log(f"dump_products: 共 {len(normalized)} 条，{len(by_store)} 家店铺")
+    _log(f"dump_products: 店铺顺序={list(by_store.keys())}")
     first_store = True
     for store_name, items in by_store.items():
         _log(f"dump_products: 店铺 {store_name!r}，商品数 {len(items)}")
@@ -2283,13 +2877,12 @@ def dump_products_by_list(
         first_store = False
         out = search_store(store_name)
         if not out.get("ok"):
-            _log(f"dump_products: search_store 失败 {out}，重启 app 后继续下一家")
+            _log(f"dump_products: search_store 失败 {out}，跳过当前店铺继续下一家")
             for it in items:
                 rows.append({"store": store_name, "product": it["product"], "price": it["price"], "link": ""})
-            open_app(stop=True)
-            time.sleep(1.2)
             continue
         time.sleep(1.2)
+        store_skip = False
         for idx, it in enumerate(items):
             product_keyword = it["product"]
             price_str = it["price"]
@@ -2307,12 +2900,11 @@ def dump_products_by_list(
                 xml_str = (out.get("result") or {}).get("xml") or ""
                 cen = _find_store_search_box_center(xml_str, h, w)
                 if not cen:
-                    _log("dump_products: 未找到店铺内搜索框，重启 app 后继续")
+                    _log("dump_products: 未找到店铺内搜索框，跳过当前店铺继续下一家")
                     rows.append({"store": store_name, "product": product_keyword, "price": price_str, "link": ""})
                     for rest in items[idx + 1 :]:
                         rows.append({"store": store_name, "product": rest["product"], "price": rest["price"], "link": ""})
-                    open_app(stop=True)
-                    time.sleep(1.2)
+                    store_skip = True
                     break
                 u.click(x=cen[0], y=cen[1])
                 time.sleep(0.8)
@@ -2320,26 +2912,22 @@ def dump_products_by_list(
                 rows.append({"store": store_name, "product": product_keyword, "price": price_str, "link": ""})
                 for rest in items[idx + 1 :]:
                     rows.append({"store": store_name, "product": rest["product"], "price": rest["price"], "link": ""})
-                _log("dump_products: 店内搜索失败，重启 app 后继续下一家")
-                open_app(stop=True)
-                time.sleep(1.2)
+                _log("dump_products: 店内搜索失败，跳过当前店铺继续下一家")
+                store_skip = True
                 break
             time.sleep(1.2)
-            u.dump()
-            out = u.last_result
-            if not out.get("ok"):
+            poster_cen = _find_product_poster_center_with_scroll(
+                u,
+                product_keyword=product_keyword,
+                expected_price=price_str,
+                screen_w=w,
+                screen_h=h,
+                max_scrolls=10,
+            )
+            if not poster_cen:
+                _log(f"dump_products: 未找到商品 {product_keyword!r} 卡片，记录空链接并继续下一个商品")
                 rows.append({"store": store_name, "product": product_keyword, "price": price_str, "link": ""})
                 continue
-            xml_str = (out.get("result") or {}).get("xml") or ""
-            poster_cen = _find_first_product_poster_center(xml_str, product_keyword, expected_price=price_str)
-            if not poster_cen:
-                _log(f"dump_products: 未找到商品 {product_keyword!r} 卡片，重启 app 后继续下一家")
-                rows.append({"store": store_name, "product": product_keyword, "price": price_str, "link": ""})
-                for rest in items[idx + 1 :]:
-                    rows.append({"store": store_name, "product": rest["product"], "price": rest["price"], "link": ""})
-                open_app(stop=True)
-                time.sleep(1.2)
-                break
             u.click(x=poster_cen[0], y=poster_cen[1])
             time.sleep(1.5)
             link = _click_share_and_copy_link_pdd(u, w, h)
@@ -2352,6 +2940,10 @@ def dump_products_by_list(
             if idx >= len(items) - 1:
                 u.press("back")
                 time.sleep(0.6)
+        if store_skip:
+            _log(f"dump_products: 店铺 {store_name!r} 已提前结束，准备进入下一家店铺")
+            continue
+        _log(f"dump_products: 店铺 {store_name!r} 处理完成，进入下一家店铺")
     out_path = output_csv
     if not out_path:
         out_path = "banya_hotspots_" + datetime.now().strftime("%y%m%d") + ".csv"
@@ -2651,6 +3243,7 @@ def dump_store_page(
     no_dedup: bool = True,
     max_scrolls: int = 5,
     max_products_scrolls: Optional[int] = None,
+    use_detail_flow: bool = False,
 ) -> dict:
     """
     若提供 store_keyword：search_store(店铺名) 进入目标店铺 → 滑到底 dump 并合并 → 结构化（可输出 CSV）。
@@ -2690,6 +3283,7 @@ def dump_store_page(
         no_dedup=no_dedup,
         max_cart_scrolls=max_scrolls,
         max_products_scrolls=max_products_scrolls,
+        use_detail_flow=use_detail_flow,
     )
     if not scroll_out.get("ok"):
         _log(f"dump_store_page: scroll_store_to_end 失败: {scroll_out}")
@@ -2751,6 +3345,7 @@ def dump_stores_to_csv(
             end_marker=end_marker,
             output_csv=None,
             no_dedup=no_dedup,
+            use_detail_flow=True,
         )
         if out.get("ok"):
             rows = (out.get("result") or {}).get("rows") or []
