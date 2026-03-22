@@ -811,7 +811,12 @@ def scroll_store_to_end(
             tit = (p.get("title_short") or p.get("title") or "").strip()[:40]
             pr = p.get("price")
             _log(f"scroll_store_to_end:   [{j}] {tit!r} price={pr!r}")
-        parsed_in_last_screen = tmp
+        # BUG FIX: 应该用本屏所有有价商品作比较，而不是本屏新增商品
+        # 否则当 tmp=[] 时，下一屏的任何商品都会被误认为"新"商品，导致无限循环
+        parsed_in_last_screen = [
+            p for p in parsed_in_current_screen
+            if _normalize_price_for_key(p.get("price"))
+        ]
 
         total_now = sum(len(batch) for batch in parsed_list)
         """
