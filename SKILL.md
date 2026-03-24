@@ -75,6 +75,22 @@ python pdd_skills/pdd_skills_cli.py dump-products --limit 5
 
 ```
 
+## Extra helper: unlock phone screen
+
+Use this helper before running app automation when the device is locked.
+
+- Script: `app_skills/unlock_phone_screen.py`
+- Mock reference: `app_skills/mocks/hms4_unlock.xml`
+- Input: 6-digit numeric password
+
+```bash
+# from repo root
+python app_skills/unlock_phone_screen.py --password 123456
+
+# with explicit device
+python app_skills/unlock_phone_screen.py --password 123456 --device 192.168.1.8:5555
+```
+
 ## Dependencies
 
 See `requirements.txt` (includes mobile_agent, uiautomator_android, etc.).

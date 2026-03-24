@@ -24,7 +24,8 @@ PDD_PACKAGE = "com.xunmeng.pinduoduo"
 
 def _log(msg: str) -> None:
     """流程日志，便于定位 dump_store_page 卡点。"""
-    print(f"[pdd_store] {msg}", flush=True)
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{ts}] [pdd_store] {msg}", flush=True)
 
 # 店铺首页结构（参考 store.xml）：
 # - 顶部 [0~600]：店铺头像、店名、全店总售、好评/推荐/逛过、关注/客服、保障条、Tab（全部商品等）
@@ -1218,6 +1219,48 @@ def _parse_cart_popup_xml(xml_str: str) -> str:
     return "\n".join(lines) if lines else ""
 
 
+def _is_cart_layer_xml(xml_str: str) -> bool:
+    """判断当前 XML 是否处于购物车/规格弹层或相关规格页。"""
+    if not xml_str:
+        return False
+    if "关闭" in xml_str:
+        return True
+    if any(h in xml_str for h in _CART_SECTION_HEADERS):
+        return True
+    # 兼容部分样式：未出现「关闭」，但有规格区文案
+    if any(k in xml_str for k in ("已选", "规格", "数量", "单独购买", "免拼购买")):
+        return True
+    return False
+
+
+def _wait_until_cart_layer_ready(
+    u: Any, screen_w: int, screen_h: int, max_tries: int = 3, sleep_s: float = 0.45
+) -> bool:
+    """
+    点击右下购买入口后，轮询确认是否真的进入购物车/规格层。
+    若识别到干扰弹窗会先尝试关闭后继续检测。
+    """
+    for i in range(max_tries):
+        _dismiss_intrusive_popups_if_present(u, screen_w, screen_h, max_tries=1)
+        u.dump()
+        out = u.last_result
+        if not out.get("ok"):
+            _log(f"click_debug: stage=open_cart_postcheck, attempt={i + 1}, dump_ok=False")
+            time.sleep(sleep_s)
+            continue
+        xml_str = (out.get("result") or {}).get("xml") or ""
+        is_cart = _is_cart_layer_xml(xml_str)
+        is_detail = _is_product_detail_page_xml(xml_str, screen_h)
+        _log(
+            f"click_debug: stage=open_cart_postcheck, attempt={i + 1}, "
+            f"is_cart={is_cart}, is_detail={is_detail}"
+        )
+        if is_cart:
+            return True
+        time.sleep(sleep_s)
+    return False
+
+
 def _close_cart_popup(u: Any, screen_w: int = 540, screen_h: int = 960) -> bool:
     """仅在当前确认为购物车弹窗时才按 back 关闭，避免误退上级页。"""
     u.dump()
@@ -1226,7 +1269,7 @@ def _close_cart_popup(u: Any, screen_w: int = 540, screen_h: int = 960) -> bool:
         _log("购物车: 关弹窗 dump 失败，不按 back")
         return False
     xml_str = (out.get("result") or {}).get("xml") or ""
-    is_cart = "关闭" in xml_str or any(h in xml_str for h in _CART_SECTION_HEADERS)
+    is_cart = _is_cart_layer_xml(xml_str)
     if not is_cart:
         _log("===============购物车: 关弹窗 当前不在购物车弹窗内，不按 back==========")
         return True
@@ -1284,7 +1327,7 @@ def _is_intrusive_popup(xml_str: str) -> bool:
     """当前 dump 是否为干扰弹窗（非购物车弹窗）。有「确定放弃吗?」或「先去逛逛」且非购物车即视为干扰弹窗。"""
     if not xml_str:
         return False
-    is_cart = "关闭" in xml_str or any(h in xml_str for h in _CART_SECTION_HEADERS)
+    is_cart = _is_cart_layer_xml(xml_str)
     if is_cart:
         return False
     return any(m in xml_str for m in _INTRUSIVE_POPUP_MARKERS)
@@ -2207,15 +2250,19 @@ def _open_cart_from_detail(u: Any, screen_w: int, screen_h: int) -> bool:
         )
         _log(f"详情页: 点击右下角入口 {best_center}")
         u.click(x=best_center[0], y=best_center[1])
-        time.sleep(1.0)
-        return True
+        time.sleep(0.6)
+        ok = _wait_until_cart_layer_ready(u, screen_w, screen_h)
+        _log(f"click_debug: stage=open_cart_postcheck_result, source=best, ok={ok}")
+        return ok
     # 回退：购买区中心（与 product*.xml 区域一致）
     fallback = (int(screen_w * 0.68), int(screen_h * 0.95))
     _node_click_debug(stage="open_cart_fallback", center=fallback, extra="reason=no_bottom_buy_node")
     _log(f"详情页: 未识别到右下入口，最终回退点击 {fallback}")
     u.click(x=fallback[0], y=fallback[1])
-    time.sleep(1.0)
-    return True
+    time.sleep(0.6)
+    ok = _wait_until_cart_layer_ready(u, screen_w, screen_h)
+    _log(f"click_debug: stage=open_cart_postcheck_result, source=fallback, ok={ok}")
+    return ok
 
 
 def _center_from_xml_node_id(xml_node_id: str) -> Optional[Tuple[int, int]]:
@@ -2353,14 +2400,22 @@ def _enrich_products_via_detail_flow(
             remark = _collect_cart_remark_with_scroll(u, screen_w, screen_h, max_scrolls=max_cart_scrolls)
             if remark:
                 _log(f"详情流程: 缺货明细 {remark[:60]!r}")
-            # 返回详情页（购物车弹窗/页）
-            u.press("back")
-            time.sleep(0.6)
+            # 仅在确认处于购物车/规格层时关闭，避免误退上级页面
+            _close_cart_popup(u, screen_w, screen_h)
+            time.sleep(0.5)
+        else:
+            _log("详情流程: open_cart_postcheck_failed，跳过备注采集")
         p["备注"] = remark or ""
 
         # 返回商品列表页
-        u.press("back")
-        time.sleep(1.0)
+        u.dump()
+        out_after = u.last_result
+        xml_after = ((out_after.get("result") or {}).get("xml") or "") if out_after.get("ok") else ""
+        if _is_product_detail_page_xml(xml_after, screen_h):
+            u.press("back")
+            time.sleep(1.0)
+        else:
+            _log("详情流程: skip_back_from_detail，reason=not_on_detail_page")
         _ensure_on_product_list_page(u, screen_w, screen_h)
 
 
