@@ -79,6 +79,35 @@ def _save_uiautomator_screenshot(u: Any, reason: str) -> str:
     return ""
 
 
+def _log_surfaceflinger_layers(u: Any, reason: str, head_limit: int = 20) -> None:
+    """
+    诊断用：打印 SurfaceFlinger layer 摘要，辅助判断是否被系统弹窗/广告层覆盖。
+    仅在异常路径调用，避免平时日志过多。
+    """
+    try:
+        out = u.shell("dumpsys SurfaceFlinger --list")
+        if not isinstance(out, dict) or not out.get("ok"):
+            _log(f"debug_layers: reason={reason}, status=failed, detail={out}")
+            return
+        txt = ((out.get("result") or {}).get("output") or "").strip()
+        if not txt:
+            _log(f"debug_layers: reason={reason}, status=empty")
+            return
+        lines = [ln.strip() for ln in txt.splitlines() if ln.strip()]
+        interesting = [
+            ln for ln in lines
+            if any(k in ln.lower() for k in ("popup", "dialog", "toast", "systemui", "float", "advert", "splash"))
+        ]
+        sample = (interesting or lines)[:head_limit]
+        _log(
+            "debug_layers: "
+            f"reason={reason}, total={len(lines)}, sampled={len(sample)}, "
+            f"layers={sample}"
+        )
+    except Exception as e:
+        _log(f"debug_layers: reason={reason}, status=exception, err={type(e).__name__}: {e}")
+
+
 # ----- PDDAgent：扩展类，定制 search/open，init() 返回类型仍为 MobileAgent -----
 
 class PDDAgent(MobileAgent):
@@ -391,6 +420,7 @@ def search_store(store_name: str) -> dict:
         if not page_out.get("ok"):
             _log(f"search_store: ensure_search_page 重试后仍失败 {page_out}")
             _save_uiautomator_screenshot(u, "ensure_search_page_failed")
+            _log_surfaceflinger_layers(u, "ensure_search_page_failed")
             return page_out
     page_el = page_out.get("result") or {}
     # 切换到店铺搜索
@@ -413,6 +443,7 @@ def search_store(store_name: str) -> dict:
     xml_str = (out.get("result") or {}).get("xml") or ""
     if not xml_str:
         _save_uiautomator_screenshot(u, "search_result_no_xml")
+        _log_surfaceflinger_layers(u, "search_result_no_xml")
         return {"ok": False, "error": "no_xml", "detail": "店铺搜索结果页无 xml"}
     items = _parse_store_search_result_xml(xml_str)
     if not items:
@@ -454,6 +485,7 @@ def search_store(store_name: str) -> dict:
                 time.sleep(1.2)
                 return {"ok": True, "result": {"store_name": name}}
     _save_uiautomator_screenshot(u, "store_search_not_found")
+    _log_surfaceflinger_layers(u, "store_search_not_found")
     return {
         "ok": False,
         "error": "store_not_found",
