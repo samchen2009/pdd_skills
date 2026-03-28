@@ -88,6 +88,7 @@ def main() -> int:
     p_stores.add_argument("--output", "-o", dest="output_csv", required=True, help="汇总表格输出路径（CSV/XLSX）")
     p_stores.add_argument("--max-products", type=int, default=20, dest="max_products", help="单店最多点击多少个商品找进店（店铺搜索流程中未用）")
     p_stores.add_argument("--no-new-limit", type=int, default=5, dest="no_new_limit", help="店内滑到底：连续几次无新内容则停")
+    p_stores.add_argument("--no-progress-timeout", type=int, default=240, dest="no_progress_timeout", help="店内长时间无新增进度判定为卡住（秒）")
     p_click = sub.add_parser("get-product-click-targets", help="从当前页解析可点击商品位置（用于进详情）")
     p_click.add_argument("--limit", type=int, default=20, help="最多返回条数")
     p_parse = sub.add_parser("parse-store-xml", help="解析本地店铺首页 XML（无需设备）")
@@ -159,6 +160,7 @@ def main() -> int:
                 output_csv=getattr(args, "output_csv", ""),
                 max_products_to_try=getattr(args, "max_products", 20),
                 store_scroll_no_new_limit=getattr(args, "no_new_limit", 5),
+                no_progress_timeout_s=getattr(args, "no_progress_timeout", 240),
             )
             out(result)
             failed = (result.get("result") or {}).get("failed_stores") or []

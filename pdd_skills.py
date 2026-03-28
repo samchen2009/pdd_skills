@@ -69,6 +69,11 @@ def _save_uiautomator_screenshot(u: Any, reason: str) -> str:
                 f"problem={safe_reason}, file={out_path.name}, path={out_path}"
             )
             return str(out_path)
+        _log(
+            "debug_screenshot: "
+            f"problem={safe_reason}, status=not_supported_or_failed, "
+            "detail=no_uiautomator2_screenshot_api"
+        )
     except Exception as e:
         _log(f"debug: 截图失败 reason={safe_reason} err={type(e).__name__}: {e}")
     return ""
@@ -803,6 +808,7 @@ def scroll_store_to_end(
     max_cart_scrolls: int = 2,
     max_products_scrolls: Optional[int] = None,
     use_detail_flow: bool = False,
+    no_progress_timeout_s: int = 240,
 ) -> dict:
     """
     当前页为店铺首页时，逐屏下滑并合并（只合入有价商品，按 title+价格 去重）：
@@ -840,6 +846,8 @@ def scroll_store_to_end(
     round_no = 0
     scroll_count = 0
     store: Dict[str, Any] = {}
+    last_progress_ts = time.monotonic()
+    last_total_now = 0
     while True:
         round_no += 1
         _log(f"scroll_store_to_end: 第 {round_no} 轮 dump...")
@@ -889,9 +897,25 @@ def scroll_store_to_end(
         ]
 
         total_now = sum(len(batch) for batch in parsed_list)
+        if total_now > last_total_now:
+            last_total_now = total_now
+            last_progress_ts = time.monotonic()
         """
         _log(f"scroll_store_to_end: 本屏有价={len([p for p in parsed_in_current_screen if _normalize_price_for_key(p.get('price'))])}，本屏新增={len(tmp)}，累计 {total_now} 条，连续无新增={no_slide_count}/{no_new_limit}")
         """
+        idle_s = int(time.monotonic() - last_progress_ts)
+        if no_progress_timeout_s > 0 and idle_s >= no_progress_timeout_s:
+            err = {
+                "ok": False,
+                "error": "stuck_no_progress",
+                "detail": (
+                    f"scroll_store_to_end 超过 {no_progress_timeout_s}s 无新增商品；"
+                    f"round={round_no}, scroll_count={scroll_count}, total_now={total_now}, "
+                    f"no_slide_count={no_slide_count}"
+                ),
+            }
+            _log(f"scroll_store_to_end: 卡住检测触发 {err}")
+            return err
         if len(tmp) == 0:
             no_slide_count += 1
         else:
@@ -918,6 +942,38 @@ def scroll_store_to_end(
     merged = {"store": store, "products": merged_products}
     _log(f"scroll_store_to_end: 共 {len(parsed_list)} 屏，合并商品数={len(merged_products)}，完成")
     return {"ok": True, "result": {"merged": merged, "parsed_list": parsed_list}}
+
+
+def _dump_stores_checkpoint_path(output_csv: str) -> str:
+    return output_csv + ".checkpoint.json"
+
+
+def _save_dump_stores_checkpoint(
+    *,
+    output_csv: str,
+    current_index: int,
+    current_store: str,
+    success_stores: List[str],
+    failed_stores: List[Dict[str, Any]],
+    total_rows: int,
+    state: str,
+    note: str = "",
+) -> None:
+    payload = {
+        "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "state": state,
+        "current_index": current_index,
+        "current_store": current_store,
+        "success_stores": success_stores,
+        "failed_stores": failed_stores,
+        "total_rows": total_rows,
+        "output_csv": output_csv if total_rows > 0 else None,
+        "note": note,
+    }
+    ckpt = _dump_stores_checkpoint_path(output_csv)
+    with open(ckpt, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    _log(f"dump_stores_to_csv: checkpoint 已写入 {ckpt} state={state} total_rows={total_rows}")
 
 
 def merge_store_parsed_list(parsed_list: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -3689,6 +3745,7 @@ def dump_store_page(
     max_scrolls: int = 5,
     max_products_scrolls: Optional[int] = None,
     use_detail_flow: bool = False,
+    no_progress_timeout_s: int = 240,
 ) -> dict:
     """
     若提供 store_keyword：search_store(店铺名) 进入目标店铺 → 滑到底 dump 并合并 → 结构化（可输出 CSV）。
@@ -3729,6 +3786,7 @@ def dump_store_page(
         max_cart_scrolls=max_scrolls,
         max_products_scrolls=max_products_scrolls,
         use_detail_flow=use_detail_flow,
+        no_progress_timeout_s=no_progress_timeout_s,
     )
     if not scroll_out.get("ok"):
         _log(f"dump_store_page: scroll_store_to_end 失败: {scroll_out}")
@@ -3759,6 +3817,7 @@ def dump_stores_to_csv(
     store_scroll_no_new_limit: int = 5,
     end_marker: str = STORE_END_MARKER,
     no_dedup: bool = True,
+    no_progress_timeout_s: int = 240,
 ) -> dict:
     """
     依次对多个店铺执行 dump_store_page，将各店 rows 合并后写入一个 CSV。
@@ -3783,36 +3842,93 @@ def dump_stores_to_csv(
             open_app(stop=True)
             time.sleep(3.2)
         _log(f"dump_stores_to_csv: 处理店铺 {kw!r} ({len(success_stores) + len(failed_stores) + 1}/{len(store_keywords)})")
-        out = dump_store_page(
-            store_keyword=kw,
-            max_products_to_try=max_products_to_try,
-            store_scroll_no_new_limit=store_scroll_no_new_limit,
-            end_marker=end_marker,
-            output_csv=None,
-            no_dedup=no_dedup,
-            use_detail_flow=True,
-        )
+        try:
+            out = dump_store_page(
+                store_keyword=kw,
+                max_products_to_try=max_products_to_try,
+                store_scroll_no_new_limit=store_scroll_no_new_limit,
+                end_marker=end_marker,
+                output_csv=None,
+                no_dedup=no_dedup,
+                use_detail_flow=True,
+                max_scrolls=2,
+                max_products_scrolls=None,
+                no_progress_timeout_s=no_progress_timeout_s,
+            )
+        except Exception as e:
+            out = {
+                "ok": False,
+                "error": type(e).__name__,
+                "detail": str(e),
+            }
         if out.get("ok"):
             rows = (out.get("result") or {}).get("rows") or []
             all_rows.extend(rows)
             success_stores.append(kw)
             _log(f"dump_stores_to_csv: 店铺 {kw!r} 成功，rows={len(rows)}，累计 {len(all_rows)} 行")
+            if all_rows:
+                write_store_csv(all_rows, output_csv)
+            _save_dump_stores_checkpoint(
+                output_csv=output_csv,
+                current_index=i,
+                current_store=kw,
+                success_stores=success_stores,
+                failed_stores=failed_stores,
+                total_rows=len(all_rows),
+                state="running",
+                note="store_success",
+            )
         else:
+            err_code = out.get("error", "unknown")
+            err_detail = out.get("detail", "")
             failed_stores.append({
                 "store": kw,
-                "error": out.get("error", "unknown"),
-                "detail": out.get("detail", ""),
+                "error": err_code,
+                "detail": err_detail,
             })
-            _log(f"dump_stores_to_csv: 店铺 {kw!r} 失败，跳过: {out.get('error')} {out.get('detail', '')}")
-            if out.get("error") in ("no_search_elements", "tab_not_found"):
-                _log("dump_stores_to_csv: 搜索页异常（未解析到搜索框/按钮或未找到 tab），重启拼多多以便下一店铺正常搜索")
+            _log(f"dump_stores_to_csv: 店铺 {kw!r} 失败，跳过: {err_code} {err_detail}")
+            # 失败也先落盘，避免中途崩溃丢已完成结果
+            if all_rows:
+                write_store_csv(all_rows, output_csv)
+            _save_dump_stores_checkpoint(
+                output_csv=output_csv,
+                current_index=i,
+                current_store=kw,
+                success_stores=success_stores,
+                failed_stores=failed_stores,
+                total_rows=len(all_rows),
+                state="running",
+                note=f"store_failed:{err_code}",
+            )
+            if err_code in ("no_search_elements", "tab_not_found", "stuck_no_progress"):
+                _log("dump_stores_to_csv: 搜索/进度异常，重启拼多多以便下一店铺继续")
                 open_app(stop=True)
                 time.sleep(1.2)
     if all_rows:
         _log(f"dump_stores_to_csv: 写入汇总 CSV {output_csv}，共 {len(all_rows)} 行")
         write_store_csv(all_rows, output_csv)
+        _save_dump_stores_checkpoint(
+            output_csv=output_csv,
+            current_index=len(store_keywords) - 1 if store_keywords else -1,
+            current_store="",
+            success_stores=success_stores,
+            failed_stores=failed_stores,
+            total_rows=len(all_rows),
+            state="completed",
+            note="all_done",
+        )
     else:
         _log("dump_stores_to_csv: 无成功店铺数据，不写入表格")
+        _save_dump_stores_checkpoint(
+            output_csv=output_csv,
+            current_index=len(store_keywords) - 1 if store_keywords else -1,
+            current_store="",
+            success_stores=success_stores,
+            failed_stores=failed_stores,
+            total_rows=0,
+            state="completed",
+            note="no_rows",
+        )
     return {
         "ok": True,
         "result": {
