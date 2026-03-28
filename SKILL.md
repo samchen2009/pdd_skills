@@ -91,6 +91,23 @@ python app_skills/unlock_phone_screen.py --password 123456
 python app_skills/unlock_phone_screen.py --password 123456 --device 192.168.1.8:5555
 ```
 
+## Troubleshooting: failure screenshots
+
+When store search fails on abnormal pages (for example popup-covered startup page, missing search page, empty result XML), `pdd_skills` now auto-saves UI screenshots via `uiautomator2`.
+
+- Screenshot directory: `pdd_skills/tmp/debug_screenshots/`
+- Log marker: `debug_screenshot: problem=..., file=..., path=...`
+- Typical problem values:
+  - `ensure_search_page_failed`
+  - `search_result_no_xml`
+  - `store_search_not_found`
+
+Quick workflow:
+
+1. Search logs for `debug_screenshot`.
+2. Open the printed screenshot `path`.
+3. Correlate with nearby `pdd_store` logs (`search_store`, popup close attempts, retries).
+
 ## Dependencies
 
 See `requirements.txt` (includes mobile_agent, uiautomator_android, etc.).
