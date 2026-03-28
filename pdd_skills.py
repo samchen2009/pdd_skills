@@ -17,7 +17,7 @@ import unicodedata
 import xml.etree.ElementTree as ET
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 from mobile_agent import MobileAgent
 
@@ -841,6 +841,7 @@ def scroll_store_to_end(
     max_products_scrolls: Optional[int] = None,
     use_detail_flow: bool = False,
     no_progress_timeout_s: int = 240,
+    heartbeat_hook: Optional[Callable[[Dict[str, Any]], None]] = None,
 ) -> dict:
     """
     当前页为店铺首页时，逐屏下滑并合并（只合入有价商品，按 title+价格 去重）：
@@ -936,6 +937,17 @@ def scroll_store_to_end(
         _log(f"scroll_store_to_end: 本屏有价={len([p for p in parsed_in_current_screen if _normalize_price_for_key(p.get('price'))])}，本屏新增={len(tmp)}，累计 {total_now} 条，连续无新增={no_slide_count}/{no_new_limit}")
         """
         idle_s = int(time.monotonic() - last_progress_ts)
+        if heartbeat_hook is not None:
+            try:
+                heartbeat_hook({
+                    "round_no": round_no,
+                    "scroll_count": scroll_count,
+                    "total_now": total_now,
+                    "no_slide_count": no_slide_count,
+                    "idle_s": idle_s,
+                })
+            except Exception as e:
+                _log(f"scroll_store_to_end: heartbeat_hook 异常，忽略: {type(e).__name__}: {e}")
         if no_progress_timeout_s > 0 and idle_s >= no_progress_timeout_s:
             err = {
                 "ok": False,
@@ -3866,6 +3878,7 @@ def dump_store_page(
     max_products_scrolls: Optional[int] = None,
     use_detail_flow: bool = False,
     no_progress_timeout_s: int = 240,
+    heartbeat_hook: Optional[Callable[[Dict[str, Any]], None]] = None,
 ) -> dict:
     """
     若提供 store_keyword：search_store(店铺名) 进入目标店铺 → 滑到底 dump 并合并 → 结构化（可输出 CSV）。
@@ -3907,6 +3920,7 @@ def dump_store_page(
         max_products_scrolls=max_products_scrolls,
         use_detail_flow=use_detail_flow,
         no_progress_timeout_s=no_progress_timeout_s,
+        heartbeat_hook=heartbeat_hook,
     )
     if not scroll_out.get("ok"):
         _log(f"dump_store_page: scroll_store_to_end 失败: {scroll_out}")
@@ -3939,6 +3953,7 @@ def dump_stores_to_csv(
     no_dedup: bool = True,
     no_progress_timeout_s: int = 240,
     same_store_retries: int = 2,
+    timed_checkpoint_interval_s: int = 120,
 ) -> dict:
     """
     依次对多个店铺执行 dump_store_page，将各店 rows 合并后写入一个 CSV。
@@ -3953,6 +3968,35 @@ def dump_stores_to_csv(
     _log("dump_stores_to_csv: 重启拼多多，从首页开始...")
     open_app(stop=True)
     time.sleep(1.2)
+    last_timed_checkpoint_ts = time.monotonic()
+
+    def _maybe_timed_checkpoint(
+        *,
+        current_index: int,
+        current_store: str,
+        force: bool = False,
+        note: str = "timed",
+    ) -> None:
+        nonlocal last_timed_checkpoint_ts
+        interval = max(0, int(timed_checkpoint_interval_s))
+        if not force:
+            if interval <= 0:
+                return
+            if time.monotonic() - last_timed_checkpoint_ts < interval:
+                return
+        if all_rows:
+            write_store_csv(all_rows, output_csv)
+        _save_dump_stores_checkpoint(
+            output_csv=output_csv,
+            current_index=current_index,
+            current_store=current_store,
+            success_stores=success_stores,
+            failed_stores=failed_stores,
+            total_rows=len(all_rows),
+            state="running",
+            note=note,
+        )
+        last_timed_checkpoint_ts = time.monotonic()
     retryable_errors = {
         "tab_not_found",
         "target_tab_not_found",
@@ -3973,6 +4017,11 @@ def dump_stores_to_csv(
         out: Dict[str, Any] = {"ok": False, "error": "unknown", "detail": ""}
         total_attempts = max(0, int(same_store_retries)) + 1
         for attempt in range(total_attempts):
+            _maybe_timed_checkpoint(
+                current_index=i,
+                current_store=kw,
+                note=f"timed_before_attempt:{attempt + 1}",
+            )
             if attempt > 0:
                 _log(f"dump_stores_to_csv: 店铺 {kw!r} 第 {attempt + 1}/{total_attempts} 次重试，先重启拼多多...")
                 open_app(stop=True)
@@ -3989,6 +4038,15 @@ def dump_stores_to_csv(
                     max_scrolls=2,
                     max_products_scrolls=None,
                     no_progress_timeout_s=no_progress_timeout_s,
+                    heartbeat_hook=lambda info, _i=i, _kw=kw: _maybe_timed_checkpoint(
+                        current_index=_i,
+                        current_store=_kw,
+                        note=(
+                            "timed_heartbeat:"
+                            f"round={info.get('round_no')},idle={info.get('idle_s')},"
+                            f"total={info.get('total_now')}"
+                        ),
+                    ),
                 )
             except Exception as e:
                 out = {
