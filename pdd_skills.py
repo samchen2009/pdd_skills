@@ -13,7 +13,9 @@ import json
 import re
 import sys
 import time
+import unicodedata
 import xml.etree.ElementTree as ET
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -45,6 +47,31 @@ def _u():
     """获取当前设备单例（mobile_agent UIAutomator）。"""
     from mobile_agent.uiautomator import UIAutomator
     return UIAutomator.get_instance()
+
+
+def _save_uiautomator_screenshot(u: Any, reason: str) -> str:
+    """
+    使用 uiautomator2 保存当前屏幕截图到 pdd_skills/tmp/debug_screenshots。
+    返回截图路径；失败时返回空字符串。
+    """
+    safe_reason = re.sub(r"[^0-9A-Za-z_\-]+", "_", (reason or "unknown")).strip("_") or "unknown"
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_dir = Path(__file__).resolve().parent / "tmp" / "debug_screenshots"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / f"{safe_reason}_{ts}.png"
+    try:
+        dev = getattr(u, "_dev", None)
+        d = getattr(dev, "_d", None) if dev else None
+        if d is not None and hasattr(d, "screenshot"):
+            d.screenshot(str(out_path))
+            _log(
+                "debug_screenshot: "
+                f"problem={safe_reason}, file={out_path.name}, path={out_path}"
+            )
+            return str(out_path)
+    except Exception as e:
+        _log(f"debug: 截图失败 reason={safe_reason} err={type(e).__name__}: {e}")
+    return ""
 
 
 # ----- PDDAgent：扩展类，定制 search/open，init() 返回类型仍为 MobileAgent -----
@@ -313,6 +340,32 @@ def _parse_store_search_result_xml(xml_str: str) -> List[Dict[str, Any]]:
     return unique
 
 
+def _try_close_popup_for_search_recovery(
+    u: Any, screen_w: int, screen_h: int
+) -> bool:
+    """
+    搜索异常时尝试关闭启动/运行中弹窗：
+    1) 先按已知干扰弹窗规则关闭；
+    2) 若仍可能有遮挡，尝试通用右上角关闭位。
+    """
+    dismissed = _dismiss_intrusive_popups_if_present(u, screen_w, screen_h, max_tries=2)
+    if dismissed:
+        _log("search_store: 已关闭干扰弹窗，准备重试搜索")
+        return True
+    u.dump()
+    out = u.last_result
+    if not out.get("ok"):
+        return False
+    xml_str = (out.get("result") or {}).get("xml") or ""
+    target = _find_popup_dismiss_target(xml_str, screen_w, screen_h)
+    if target:
+        _log(f"search_store: 尝试关闭启动弹窗 at {target}")
+        u.click(x=target[0], y=target[1])
+        time.sleep(0.6)
+        return True
+    return False
+
+
 def search_store(store_name: str) -> dict:
     """
     完整店铺搜索并进入目标店铺：
@@ -320,10 +373,20 @@ def search_store(store_name: str) -> dict:
     返回 {"ok": True, "result": {"store_name": 匹配的店名}} 或错误 dict。
     """
     _log(f"search_store: 开始，目标={store_name!r}")
+    u = _u()
+    win = u.window_size()
+    w = (win.get("result") or {}).get("width") or 540
+    h = (win.get("result") or {}).get("height") or 960
     page_out = ensure_search_page()
     if not page_out.get("ok"):
-        _log(f"search_store: ensure_search_page 失败 {page_out}")
-        return page_out
+        _log(f"search_store: ensure_search_page 失败，尝试关弹窗后重试: {page_out}")
+        recovered = _try_close_popup_for_search_recovery(u, w, h)
+        if recovered:
+            page_out = ensure_search_page()
+        if not page_out.get("ok"):
+            _log(f"search_store: ensure_search_page 重试后仍失败 {page_out}")
+            _save_uiautomator_screenshot(u, "ensure_search_page_failed")
+            return page_out
     page_el = page_out.get("result") or {}
     # 切换到店铺搜索
     tab_out = select_store_search_tab()
@@ -337,7 +400,6 @@ def search_store(store_name: str) -> dict:
         search_button=page_el.get("search_button"),
     )
     time.sleep(1.5)
-    u = _u()
     u.dump()
     out = u.last_result
     if not out.get("ok"):
@@ -345,8 +407,17 @@ def search_store(store_name: str) -> dict:
         return out
     xml_str = (out.get("result") or {}).get("xml") or ""
     if not xml_str:
+        _save_uiautomator_screenshot(u, "search_result_no_xml")
         return {"ok": False, "error": "no_xml", "detail": "店铺搜索结果页无 xml"}
     items = _parse_store_search_result_xml(xml_str)
+    if not items:
+        # 可能被启动弹窗遮挡，先尝试关闭并在当前结果页重读一次
+        if _try_close_popup_for_search_recovery(u, w, h):
+            u.dump()
+            out = u.last_result
+            if out.get("ok"):
+                xml_str = (out.get("result") or {}).get("xml") or ""
+                items = _parse_store_search_result_xml(xml_str) if xml_str else []
     _log(f"search_store: 解析到 {len(items)} 个店铺")
     target_store_name = store_name.strip()
     for item in items:
@@ -360,9 +431,6 @@ def search_store(store_name: str) -> dict:
             time.sleep(1.2)
             return {"ok": True, "result": {"store_name": name}}
     _log("search_store: 未找到目标店铺，尝试下滑再找")
-    win = u.window_size()
-    w = (win.get("result") or {}).get("width") or 540
-    h = (win.get("result") or {}).get("height") or 960
     for _ in range(5):
         u.swipe(w // 2, int(h * 0.7), w // 2, int(h * 0.3), duration=0.3)
         time.sleep(0.9)
@@ -380,6 +448,7 @@ def search_store(store_name: str) -> dict:
                 u.click(x=cx, y=cy)
                 time.sleep(1.2)
                 return {"ok": True, "result": {"store_name": name}}
+    _save_uiautomator_screenshot(u, "store_search_not_found")
     return {
         "ok": False,
         "error": "store_not_found",
@@ -1081,7 +1150,7 @@ _LAST_PIECES_RE = re.compile(r"最后\s*(\d+)\s*件")
 _CART_POPUP_SKIP_TEXTS = frozenset({
     "型号", "款式", "颜色", "关闭", "取消", "×", "X",
     "手动添加地址", "优惠", "添加", "提交订单", "减少数量", "增加数量",
-    "已选", "商品主图", "用多多支付", "使用#微信支付", "更换支付方式", "打开大图",
+    "已选", "商品主图", "用多多支付", "使用#微信支付", "更换支付方式", "打开大图", "查看大图",
 })
 
 
@@ -1095,15 +1164,28 @@ _ONLY_LAST_PIECES_RE = re.compile(r"^最后\s*\d+\s*件\s*$")
 _CART_SECTION_HEADERS = ("型号", "款式", "颜色")
 
 
+def _is_invalid_spec_name(name: str) -> bool:
+    s = (name or "").strip()
+    if not s:
+        return True
+    # 纯符号（如 "#"）或过短噪声
+    if re.fullmatch(r"[#\+\-_/\.]+", s):
+        return True
+    # 纯规格单位（如 "4.5g"）
+    if re.fullmatch(r"\d+(\.\d+)?\s*(g|kg|ml|l|克|毫升|oz)?", s, flags=re.IGNORECASE):
+        return True
+    return False
+
+
 def _spec_name_from_view_group(node: ET.Element) -> Optional[str]:
     """从 ViewGroup 节点取规格名：content-desc 或子节点 tv_content 的 text。"""
     desc = (node.get("content-desc") or "").strip()
-    if desc and desc not in _CART_POPUP_SKIP_TEXTS:
-        return desc
+    if desc and desc not in _CART_POPUP_SKIP_TEXTS and not _is_invalid_spec_name(desc):
+        return re.sub(r"\s+", " ", desc).strip()
     for c in node.iter():
         if "tv_content" in (c.get("resource-id") or ""):
             t = (c.get("text") or "").strip()
-            if t and t not in _CART_POPUP_SKIP_TEXTS:
+            if t and t not in _CART_POPUP_SKIP_TEXTS and not _is_invalid_spec_name(t):
                 return t
     return None
 
@@ -1213,6 +1295,48 @@ def _parse_cart_popup_xml_to_last_pieces_lines(xml_str: str) -> List[str]:
     for ln in sorted(seen_lines):
         if ln not in result and not _ONLY_LAST_PIECES_RE.match(ln):
             result.append(ln)
+    # recovery pass：按就近 y 坐标配对「最后X件」与规格 ViewGroup(content-desc)，避免丢行
+    if section_y is not None:
+        spec_candidates: List[Tuple[str, int]] = []  # (spec_text, y_center)
+        count_nodes: List[Tuple[str, int]] = []  # (count_text, y_center)
+        for n in root.iter():
+            if n.get("package") != package:
+                continue
+            b = _parse_bounds(n.get("bounds") or "")
+            if not b or len(b) < 4:
+                continue
+            y_c = (b[1] + b[3]) // 2
+            if y_c <= section_y or y_c >= bottom_cutoff:
+                continue
+            t = (n.get("text") or "").strip()
+            if _LAST_PIECES_IN_LINE_RE.search(t):
+                count_nodes.append((t, y_c))
+            if (n.get("class") or "") == "android.view.ViewGroup":
+                spec = _spec_name_from_view_group(n)
+                if spec and not _LAST_PIECES_IN_LINE_RE.search(spec):
+                    spec_candidates.append((spec, y_c))
+        used_spec_idx: Set[int] = set()
+        for count_text, cy in count_nodes:
+            best_idx = -1
+            best_dist = 10**9
+            for idx, (spec_text, sy) in enumerate(spec_candidates):
+                if idx in used_spec_idx:
+                    continue
+                dist = abs(sy - cy)
+                if dist <= 240 and dist < best_dist:
+                    best_dist = dist
+                    best_idx = idx
+            if best_idx >= 0:
+                used_spec_idx.add(best_idx)
+                spec_text = spec_candidates[best_idx][0]
+                line = re.sub(r"\s+", " ", f"{spec_text} {count_text}").strip()
+                if (
+                    line
+                    and _LAST_PIECES_IN_LINE_RE.search(line)
+                    and not _ONLY_LAST_PIECES_RE.match(line)
+                    and line not in result
+                ):
+                    result.append(line)
     return result
 
 
@@ -1721,6 +1845,7 @@ def _enrich_cart_remark_on_screen(
         time.sleep(1)
         remark = _collect_cart_remark_with_scroll(u, screen_w, screen_h, max_scrolls=max_cart_scrolls)
         p["备注"] = remark or ""
+        p["即将缺货明细"] = _parse_shortage_items_from_remark(p["备注"])
         if remark:
             _log(f"购物车: [商品] {remark[:60]}{'...' if len(remark) > 60 else ''!r}")
         _close_cart_popup(u, screen_w, screen_h)
@@ -1814,44 +1939,304 @@ def _enrich_cart_remark_for_products(
         time.sleep(1)
         remark = _collect_cart_remark_with_scroll(u, screen_w, screen_h, max_scrolls=max_cart_scrolls)
         p["备注"] = remark or ""
+        p["即将缺货明细"] = _parse_shortage_items_from_remark(p["备注"])
         if remark:
             """_log(f"备注={remark[:60]}{'...' if len(remark) > 60 else ''!r}")"""
         _close_cart_popup(u, screen_w, screen_h)
         time.sleep(0.5)        
 
 def to_csv_rows(store: Dict[str, Any], products: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """将店铺 + 商品列表转为可写 CSV 的扁平行列表。每行包含店铺字段 + 单商品字段 + 缺货标志 + 仅剩。"""
+    """
+    将店铺 + 商品列表转为报表行：
+    - 每发现一条「即将缺货款式（最后N件）」就生成一行；
+    - 输出列固定为 store_name/product_title/price/sales/tags/link/仅剩/即将缺货款式/缺货商品价格/剩余件数。
+    """
     rows: List[Dict[str, Any]] = []
     store_name = (store.get("store_name") or "").strip()
-    total_sales = (store.get("total_sales") or "").strip()
-    good_reviews = (store.get("good_reviews") or "").strip()
     for p in products:
         tag_list = p.get("tags") or []
         tags_str = "|".join(tag_list)
-        rows.append({
+        base = {
             "store_name": store_name,
-            "total_sales": total_sales,
-            "good_reviews": good_reviews,
             "product_title": (p.get("title") or p.get("title_short") or "").strip(),
             "price": p.get("price"),
             "sales": p.get("sales"),
             "tags": tags_str,
             "link": (p.get("link") or "").strip(),
-            "缺货标志": _out_of_stock_flag(tag_list),
             "仅剩": _extract_only_left(p),
-            "备注": (p.get("备注") or "").strip(),
-        })
+        }
+        shortage_items = p.get("即将缺货明细")
+        if not isinstance(shortage_items, list):
+            shortage_items = _parse_shortage_items_from_remark((p.get("备注") or "").strip())
+        if shortage_items:
+            for item in shortage_items:
+                if isinstance(item, tuple) and len(item) == 2:
+                    name, cnt = item
+                    shortage_price = _extract_shortage_price_from_name(str(name))
+                elif isinstance(item, tuple) and len(item) >= 3:
+                    name, cnt, shortage_price = item[0], item[1], item[2]
+                elif isinstance(item, dict):
+                    name = item.get("款式") or item.get("name") or ""
+                    cnt = item.get("件数") or item.get("count") or ""
+                    shortage_price = item.get("缺货商品价格") or item.get("price") or _extract_shortage_price_from_name(str(name))
+                else:
+                    continue
+                rows.append({
+                    **base,
+                    "即将缺货款式": str(name).strip(),
+                    "缺货商品价格": str(shortage_price).strip() if shortage_price is not None else "",
+                    "剩余件数": str(cnt).strip(),
+                })
+        elif ("即将卖完" in tags_str) or ("即将售罄" in tags_str) or ("即将卖完" in (p.get("备注") or "")):
+            # 无法定位到具体款式时，按商品级记录“即将卖完”
+            rows.append({
+                **base,
+                "即将缺货款式": base["product_title"],
+                "缺货商品价格": "",
+                "剩余件数": "即将卖完",
+            })
+        else:
+            rows.append({
+                **base,
+                "即将缺货款式": "",
+                "缺货商品价格": "",
+                "剩余件数": "",
+            })
     return rows
 
 
 def write_store_csv(rows: List[Dict[str, Any]], path: str) -> None:
-    """将 to_csv_rows 得到的行写入 CSV 文件。"""
+    """
+    写出店铺结果表格（CSV/XLSX）：
+    - 默认导出「即将缺货款式 / 剩余件数」拆分后的行；
+    - 删除 total_sales / good_reviews / 备注 / 缺货标志；
+    - 若输出为 .xlsx，按同一商品组纵向合并基础列单元格。
+    """
     if not rows:
         return
+    if "即将缺货款式" in rows[0] and "剩余件数" in rows[0]:
+        report_rows = rows
+        for rr in report_rows:
+            if "缺货商品价格" not in rr:
+                rr["缺货商品价格"] = _extract_shortage_price_from_name(
+                    _normalize_report_text(rr.get("即将缺货款式"))
+                )
+    else:
+        # 兼容历史调用方（传入旧结构行）：
+        report_rows, _ = _build_shortage_report_rows(rows)
+    merge_spans = _compute_merge_spans_from_report_rows(report_rows)
+    if str(path).lower().endswith(".xlsx"):
+        _write_store_xlsx(report_rows, merge_spans, path)
+        return
     with open(path, "w", newline="", encoding="utf-8-sig") as f:
-        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()), extrasaction="ignore")
+        writer = csv.DictWriter(f, fieldnames=list(report_rows[0].keys()), extrasaction="ignore")
         writer.writeheader()
-        writer.writerows(rows)
+        writer.writerows(report_rows)
+
+
+def _normalize_report_text(v: Any) -> str:
+    return ("" if v is None else str(v)).strip()
+
+
+def _excel_text_display_width(text: str) -> int:
+    """估算 Excel 显示宽度：全角/宽字符按 2，其余按 1。"""
+    width = 0
+    for ch in text or "":
+        width += 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+    return width
+
+
+_LAST_PIECES_IN_LINE_RE = re.compile(r"(?P<name>.*?)最后\s*(?P<count>\d+)\s*件")
+
+
+def _parse_shortage_items_from_remark(remark: str) -> List[Tuple[str, int, str]]:
+    items: List[Tuple[str, int, str]] = []
+    seen: Set[str] = set()
+    for raw in (remark or "").splitlines():
+        line = re.sub(r"\s+", " ", raw.strip())
+        if not line:
+            continue
+        for m in _LAST_PIECES_IN_LINE_RE.finditer(line):
+            raw_name = re.sub(r"[\s\-:：,，;；/]+$", "", (m.group("name") or "").strip()).strip()
+            shortage_price = _extract_shortage_price_from_name(raw_name)
+            # 规格与价格分列：规格去掉末尾价格（例如 "... ¥109"）
+            name = re.sub(r"\s*¥\s*\d+(?:\.\d+)?\s*$", "", raw_name).strip()
+            if not name:
+                continue
+            # 过滤纯「最后X件」噪声（如“最后2件 最后4件”）
+            if re.fullmatch(r"(最后\s*\d+\s*件\s*)+", name):
+                continue
+            if name in ("即将卖完", "刚刚抢光", "最后"):
+                continue
+            if _is_invalid_spec_name(name):
+                continue
+            count = int(m.group("count"))
+            key = f"{name}|{shortage_price}|{count}"
+            if key in seen:
+                continue
+            seen.add(key)
+            items.append((name, count, shortage_price))
+    return items
+
+
+def _extract_shortage_price_from_name(name: str) -> str:
+    """从缺货款式文本中提取价格（如 ¥169 / ¥169.5），未命中返回空字符串。"""
+    s = (name or "").strip()
+    if not s:
+        return ""
+    ms = re.findall(r"¥\s*(\d+(?:\.\d+)?)", s)
+    if not ms:
+        return ""
+    return f"¥{ms[-1]}"
+
+
+def _build_shortage_report_rows(
+    rows: List[Dict[str, Any]]
+) -> Tuple[List[Dict[str, Any]], List[Tuple[int, int]]]:
+    """
+    将原始 rows 转成「即将缺货」报表行。
+    返回 (report_rows, merge_spans)，其中 merge_spans 为 XLSX 纵向合并行区间（含首尾，1-based，不含表头）。
+    """
+    report_rows: List[Dict[str, Any]] = []
+    merge_spans: List[Tuple[int, int]] = []
+    data_row_count = 0
+    for r in rows:
+        store_name = _normalize_report_text(r.get("store_name"))
+        if not store_name:
+            store_name = _normalize_report_text(r.get("store"))
+        product_title = _normalize_report_text(r.get("product_title"))
+        if not product_title:
+            product_title = _normalize_report_text(r.get("product"))
+        base = {
+            "store_name": store_name,
+            "product_title": product_title,
+            "price": _normalize_report_text(r.get("price")),
+            "sales": _normalize_report_text(r.get("sales")),
+            "tags": _normalize_report_text(r.get("tags")),
+            "link": _normalize_report_text(r.get("link")),
+            "仅剩": _normalize_report_text(r.get("仅剩")),
+        }
+        remark = _normalize_report_text(r.get("备注"))
+        shortage_items = _parse_shortage_items_from_remark(remark)
+        if shortage_items:
+            start = data_row_count + 1
+            for item in shortage_items:
+                if isinstance(item, tuple) and len(item) >= 3:
+                    name, cnt, shortage_price = item[0], item[1], item[2]
+                elif isinstance(item, tuple) and len(item) == 2:
+                    name, cnt = item
+                    shortage_price = _extract_shortage_price_from_name(name)
+                else:
+                    continue
+                report_rows.append({
+                    **base,
+                    "即将缺货款式": name,
+                    "缺货商品价格": shortage_price,
+                    "剩余件数": str(cnt),
+                })
+            data_row_count += len(shortage_items)
+            end = data_row_count
+            if end > start:
+                merge_spans.append((start, end))
+        elif ("即将卖完" in _normalize_report_text(r.get("tags"))) or ("即将售罄" in _normalize_report_text(r.get("tags"))) or ("即将卖完" in remark):
+            report_rows.append({
+                **base,
+                "即将缺货款式": base["product_title"],
+                "缺货商品价格": "",
+                "剩余件数": "即将卖完",
+            })
+            data_row_count += 1
+        else:
+            report_rows.append({
+                **base,
+                "即将缺货款式": "",
+                "缺货商品价格": "",
+                "剩余件数": "",
+            })
+            data_row_count += 1
+    return report_rows, merge_spans
+
+
+def _compute_merge_spans_from_report_rows(
+    report_rows: List[Dict[str, Any]]
+) -> List[Tuple[int, int]]:
+    """
+    根据报表行内容计算可纵向合并区间（1-based，不含表头）。
+    合并条件：连续行的基础字段完全相同。
+    """
+    if not report_rows:
+        return []
+    base_fields = [
+        "store_name",
+        "product_title",
+        "price",
+        "sales",
+        "tags",
+        "link",
+        "仅剩",
+    ]
+    spans: List[Tuple[int, int]] = []
+    start = 1
+    prev_key = tuple(_normalize_report_text(report_rows[0].get(k)) for k in base_fields)
+    for i in range(2, len(report_rows) + 1):
+        key = tuple(_normalize_report_text(report_rows[i - 1].get(k)) for k in base_fields)
+        if key == prev_key:
+            continue
+        if i - 1 > start:
+            spans.append((start, i - 1))
+        start = i
+        prev_key = key
+    if len(report_rows) > start:
+        spans.append((start, len(report_rows)))
+    return spans
+
+
+def _write_store_xlsx(
+    report_rows: List[Dict[str, Any]], merge_spans: List[Tuple[int, int]], path: str
+) -> None:
+    """写 XLSX 并按商品组纵向合并基础列。"""
+    from openpyxl import Workbook
+    from openpyxl.styles import Alignment
+    from openpyxl.utils import get_column_letter
+
+    if not report_rows:
+        return
+    wb = Workbook()
+    ws = wb.active
+    headers = list(report_rows[0].keys())
+    ws.append(headers)
+    for row in report_rows:
+        ws.append([row.get(h, "") for h in headers])
+    # 基础列（除「即将缺货款式/缺货商品价格/剩余件数」）做纵向合并
+    shortage_name_col = headers.index("即将缺货款式") + 1
+    shortage_price_col = headers.index("缺货商品价格") + 1
+    shortage_count_col = headers.index("剩余件数") + 1
+    for start, end in merge_spans:
+        sheet_start = start + 1  # +1 for header
+        sheet_end = end + 1
+        for col in range(1, len(headers) + 1):
+            if col in (shortage_name_col, shortage_price_col, shortage_count_col):
+                continue
+            ws.merge_cells(
+                start_row=sheet_start,
+                start_column=col,
+                end_row=sheet_end,
+                end_column=col,
+            )
+            ws.cell(sheet_start, col).alignment = Alignment(vertical="center", wrap_text=True)
+    # 自动列宽（按文本显示宽度估算，限制在合理范围）
+    for col in range(1, len(headers) + 1):
+        max_w = _excel_text_display_width(str(headers[col - 1]))
+        for row in range(2, ws.max_row + 1):
+            v = ws.cell(row, col).value
+            if v is None:
+                continue
+            txt = str(v).replace("\n", " ")
+            w = _excel_text_display_width(txt)
+            if w > max_w:
+                max_w = w
+        ws.column_dimensions[get_column_letter(col)].width = max(8, min(80, max_w + 2))
+    wb.save(path)
 
 
 # ----- 按店铺+商品列表进店搜商品、详情页分享复制链接、产出 banya_hotspots CSV -----
@@ -2411,6 +2796,7 @@ def _enrich_products_via_detail_flow(
         else:
             _log("详情流程: open_cart_postcheck_failed，跳过备注采集")
         p["备注"] = remark or ""
+        p["即将缺货明细"] = _parse_shortage_items_from_remark(p["备注"])
 
         # 返回商品列表页
         u.dump()
@@ -2896,7 +3282,6 @@ def dump_products_by_list(
     流程：1) 按 store 排序  2) 对每个 store：search_store 进店 → 点右上角搜索 → 搜 product → 点海报进详情 →
     点分享 → 复制链接 → 记录 → 返回；重复该 store 下其余 product；再下一家 store。
     """
-    from datetime import datetime
     _log("dump_products_by_list: 重启拼多多，从首页开始...")
     open_app(stop=True)
     time.sleep(1.2)
@@ -3353,7 +3738,7 @@ def dump_store_page(
     products = merged.get("products") or []
     rows = to_csv_rows(store, products)
     if output_csv:
-        _log(f"dump_store_page: 写入 CSV {output_csv}")
+        _log(f"dump_store_page: 写入表格 {output_csv}")
         write_store_csv(rows, output_csv)
     _log(f"dump_store_page: 完成 store={bool(store)} products={len(products)} rows={len(rows)}")
     return {
@@ -3427,7 +3812,7 @@ def dump_stores_to_csv(
         _log(f"dump_stores_to_csv: 写入汇总 CSV {output_csv}，共 {len(all_rows)} 行")
         write_store_csv(all_rows, output_csv)
     else:
-        _log("dump_stores_to_csv: 无成功店铺数据，不写入 CSV")
+        _log("dump_stores_to_csv: 无成功店铺数据，不写入表格")
     return {
         "ok": True,
         "result": {
@@ -3560,7 +3945,7 @@ def dump_store_page_by_product(
     products = merged.get("products") or []
     rows = to_csv_rows(store, products)
     if output_csv:
-        _log(f"dump_store_page: 写入 CSV {output_csv}")
+        _log(f"dump_store_page: 写入表格 {output_csv}")
         write_store_csv(rows, output_csv)
     _log(f"dump_store_page: 完成 store={bool(store)} products={len(products)} rows={len(rows)}")
     return {
