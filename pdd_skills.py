@@ -980,6 +980,91 @@ def _dump_stores_checkpoint_path(output_csv: str) -> str:
     return output_csv + ".checkpoint.json"
 
 
+def _shell_output_text(u: Any, cmd: str) -> str:
+    """Best-effort run shell command and return text output."""
+    try:
+        out = u.shell(cmd)
+        if not isinstance(out, dict) or not out.get("ok"):
+            return ""
+        result = out.get("result") or {}
+        txt = result.get("output") or ""
+        if isinstance(txt, bytes):
+            return txt.decode("utf-8", errors="ignore")
+        return str(txt)
+    except Exception:
+        return ""
+
+
+def _current_package_name(u: Any) -> str:
+    """Best-effort fetch current package name."""
+    try:
+        cur_raw = u.app_current()
+        cur = cur_raw if isinstance(cur_raw, dict) else getattr(cur_raw, "last_result", {})
+        if isinstance(cur, dict) and cur.get("ok"):
+            return ((cur.get("result") or {}).get("package") or "").strip()
+    except Exception:
+        pass
+    return ""
+
+
+def _collect_runtime_snapshot(
+    output_csv: str,
+    *,
+    reason: str,
+    head_limit: int = 20,
+) -> Dict[str, Any]:
+    """
+    采集 checkpoint 快照：
+    - 异常/关键时刻截图
+    - 当前前台包名
+    - dumpsys SurfaceFlinger --list 摘要
+    - dumpsys activity top 摘要
+    """
+    snapshot: Dict[str, Any] = {
+        "captured_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "reason": reason,
+        "screenshot": "",
+        "package": "",
+        "surfaceflinger_layers": [],
+        "activity_top": [],
+    }
+    try:
+        u = _u()
+        snapshot["screenshot"] = _save_uiautomator_screenshot(u, f"checkpoint_{reason}")
+        snapshot["package"] = _current_package_name(u)
+
+        sf = _shell_output_text(u, "dumpsys SurfaceFlinger --list")
+        if sf:
+            lines = [ln.strip() for ln in sf.splitlines() if ln.strip()]
+            interesting = [
+                ln for ln in lines
+                if any(k in ln.lower() for k in ("popup", "dialog", "toast", "systemui", "float", "advert", "splash"))
+            ]
+            snapshot["surfaceflinger_layers"] = (interesting or lines)[:head_limit]
+
+        top = _shell_output_text(u, "dumpsys activity top")
+        if top:
+            keep: List[str] = []
+            for ln in top.splitlines():
+                s = ln.strip()
+                if not s:
+                    continue
+                low = s.lower()
+                if any(k in low for k in ("resumedactivity", "topresumedactivity", "mfocusedapp", "activityrecord", "cmp=", "package")):
+                    keep.append(s)
+            snapshot["activity_top"] = (keep or [ln.strip() for ln in top.splitlines() if ln.strip()])[:head_limit]
+    except Exception as e:
+        snapshot["snapshot_error"] = f"{type(e).__name__}: {e}"
+    _log(
+        "checkpoint_snapshot: "
+        f"reason={reason}, package={snapshot.get('package') or ''}, "
+        f"screenshot={snapshot.get('screenshot') or ''}, "
+        f"sf_layers={len(snapshot.get('surfaceflinger_layers') or [])}, "
+        f"activity_lines={len(snapshot.get('activity_top') or [])}"
+    )
+    return snapshot
+
+
 def _save_dump_stores_checkpoint(
     *,
     output_csv: str,
@@ -991,6 +1076,8 @@ def _save_dump_stores_checkpoint(
     state: str,
     note: str = "",
 ) -> None:
+    reason = f"{state}_{note or 'none'}_{current_index}"
+    snapshot = _collect_runtime_snapshot(output_csv, reason=reason)
     payload = {
         "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "state": state,
@@ -1001,6 +1088,7 @@ def _save_dump_stores_checkpoint(
         "total_rows": total_rows,
         "output_csv": output_csv if total_rows > 0 else None,
         "note": note,
+        "snapshot": snapshot,
     }
     ckpt = _dump_stores_checkpoint_path(output_csv)
     with open(ckpt, "w", encoding="utf-8") as f:
@@ -3850,6 +3938,7 @@ def dump_stores_to_csv(
     end_marker: str = STORE_END_MARKER,
     no_dedup: bool = True,
     no_progress_timeout_s: int = 240,
+    same_store_retries: int = 2,
 ) -> dict:
     """
     依次对多个店铺执行 dump_store_page，将各店 rows 合并后写入一个 CSV。
@@ -3864,6 +3953,13 @@ def dump_stores_to_csv(
     _log("dump_stores_to_csv: 重启拼多多，从首页开始...")
     open_app(stop=True)
     time.sleep(1.2)
+    retryable_errors = {
+        "tab_not_found",
+        "target_tab_not_found",
+        "no_search_elements",
+        "no_xml",
+        "stuck_no_progress",
+    }
     for i, kw in enumerate(store_keywords):
         kw = (kw or "").strip()
         if not kw:
@@ -3874,25 +3970,53 @@ def dump_stores_to_csv(
             open_app(stop=True)
             time.sleep(3.2)
         _log(f"dump_stores_to_csv: 处理店铺 {kw!r} ({len(success_stores) + len(failed_stores) + 1}/{len(store_keywords)})")
-        try:
-            out = dump_store_page(
-                store_keyword=kw,
-                max_products_to_try=max_products_to_try,
-                store_scroll_no_new_limit=store_scroll_no_new_limit,
-                end_marker=end_marker,
-                output_csv=None,
-                no_dedup=no_dedup,
-                use_detail_flow=True,
-                max_scrolls=2,
-                max_products_scrolls=None,
-                no_progress_timeout_s=no_progress_timeout_s,
-            )
-        except Exception as e:
-            out = {
-                "ok": False,
-                "error": type(e).__name__,
-                "detail": str(e),
-            }
+        out: Dict[str, Any] = {"ok": False, "error": "unknown", "detail": ""}
+        total_attempts = max(0, int(same_store_retries)) + 1
+        for attempt in range(total_attempts):
+            if attempt > 0:
+                _log(f"dump_stores_to_csv: 店铺 {kw!r} 第 {attempt + 1}/{total_attempts} 次重试，先重启拼多多...")
+                open_app(stop=True)
+                time.sleep(1.5)
+            try:
+                out = dump_store_page(
+                    store_keyword=kw,
+                    max_products_to_try=max_products_to_try,
+                    store_scroll_no_new_limit=store_scroll_no_new_limit,
+                    end_marker=end_marker,
+                    output_csv=None,
+                    no_dedup=no_dedup,
+                    use_detail_flow=True,
+                    max_scrolls=2,
+                    max_products_scrolls=None,
+                    no_progress_timeout_s=no_progress_timeout_s,
+                )
+            except Exception as e:
+                out = {
+                    "ok": False,
+                    "error": type(e).__name__,
+                    "detail": str(e),
+                }
+            if out.get("ok"):
+                break
+            err_code = out.get("error", "unknown")
+            err_detail = out.get("detail", "")
+            if err_code in retryable_errors and attempt < total_attempts - 1:
+                _log(
+                    f"dump_stores_to_csv: 店铺 {kw!r} 第 {attempt + 1}/{total_attempts} 次失败（可重试）: "
+                    f"{err_code} {err_detail}"
+                )
+                _save_dump_stores_checkpoint(
+                    output_csv=output_csv,
+                    current_index=i,
+                    current_store=kw,
+                    success_stores=success_stores,
+                    failed_stores=failed_stores,
+                    total_rows=len(all_rows),
+                    state="running",
+                    note=f"store_retry_pending:{err_code}:attempt={attempt + 1}",
+                )
+                continue
+            break
         if out.get("ok"):
             rows = (out.get("result") or {}).get("rows") or []
             all_rows.extend(rows)
