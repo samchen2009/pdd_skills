@@ -13,6 +13,7 @@ import json
 import re
 import sys
 import time
+import threading
 import unicodedata
 import xml.etree.ElementTree as ET
 from datetime import datetime
@@ -882,10 +883,13 @@ def scroll_store_to_end(
     last_progress_ts = time.monotonic()
     last_total_now = 0
     while True:
+        round_t0 = time.monotonic()
         round_no += 1
         _log(f"scroll_store_to_end: 第 {round_no} 轮 dump...")
+        dump_t0 = time.monotonic()
         u.dump()
         out = u.last_result
+        dump_cost_ms = int((time.monotonic() - dump_t0) * 1000)
         if not out.get("ok"):
             _log("scroll_store_to_end: dump 失败")
             return out
@@ -903,6 +907,7 @@ def scroll_store_to_end(
                 return out
             xml_str = (out.get("result") or {}).get("xml") or ""
         parsed = parse_store_page_xml(xml_str)
+        parse_cost_ms = int((time.monotonic() - dump_t0) * 1000) - dump_cost_ms
         if not store and (parsed.get("store") or {}):
             store = parsed.get("store") or {}
         parsed_in_current_screen = parsed.get("products") or []
@@ -912,11 +917,37 @@ def scroll_store_to_end(
             break
 
         tmp = merge_products(parsed_in_last_screen, parsed_in_current_screen)
+        enrich_t0 = time.monotonic()
         if tmp:
+            if heartbeat_hook is not None:
+                try:
+                    heartbeat_hook({
+                        "stage": "round_enrich_begin",
+                        "round_no": round_no,
+                        "scroll_count": scroll_count,
+                        "batch_size": len(tmp),
+                    })
+                except Exception:
+                    pass
             if use_detail_flow:
-                _enrich_products_via_detail_flow(u, tmp, w, h, max_cart_scrolls=max_cart_scrolls)
+                _enrich_products_via_detail_flow(
+                    u,
+                    tmp,
+                    w,
+                    h,
+                    max_cart_scrolls=max_cart_scrolls,
+                    heartbeat_hook=heartbeat_hook,
+                )
             else:
-                _enrich_cart_remark_for_products(u, tmp, w, h, max_cart_scrolls=max_cart_scrolls)
+                _enrich_cart_remark_for_products(
+                    u,
+                    tmp,
+                    w,
+                    h,
+                    max_cart_scrolls=max_cart_scrolls,
+                    heartbeat_hook=heartbeat_hook,
+                )
+        enrich_cost_ms = int((time.monotonic() - enrich_t0) * 1000)
         parsed_list.append(tmp)
         for j, p in enumerate(tmp):
             tit = (p.get("title_short") or p.get("title") or "").strip()[:40]
@@ -973,12 +1004,21 @@ def scroll_store_to_end(
             _log(f"scroll_store_to_end: 店内下滑次数已达 {max_products_scrolls}，停止")
             break
 
+        swipe_t0 = time.monotonic()
         u.swipe(fx, fy, tx, ty, duration=0.25)
         """
             must sleep enough time to let the screen freeze
             otherwise, click(x,y) will fail
         """
         time.sleep(1.5)
+        swipe_cost_ms = int((time.monotonic() - swipe_t0) * 1000)
+        round_cost_ms = int((time.monotonic() - round_t0) * 1000)
+        _log(
+            "scroll_store_to_end: round_timing "
+            f"round={round_no}, dump_ms={dump_cost_ms}, parse_ms={max(parse_cost_ms, 0)}, "
+            f"enrich_ms={enrich_cost_ms}, swipe_wait_ms={swipe_cost_ms}, total_ms={round_cost_ms}, "
+            f"tmp={len(tmp)}, total={total_now}, idle_s={idle_s}"
+        )
 
     merged_products: List[Dict[str, Any]] = []
     for batch in parsed_list:
@@ -1017,6 +1057,99 @@ def _current_package_name(u: Any) -> str:
     except Exception:
         pass
     return ""
+
+
+def _debug_page_flags(xml_str: str, screen_h: int) -> str:
+    """轻量页面标记，辅助定位流程漂移/卡住。"""
+    if not xml_str:
+        return "xml=empty"
+    try:
+        is_detail = _is_product_detail_page_xml(xml_str, screen_h)
+    except Exception:
+        is_detail = False
+    try:
+        is_share = _is_share_panel_open_xml(xml_str, screen_h)
+    except Exception:
+        is_share = False
+    try:
+        is_cart = _is_cart_layer_xml(xml_str)
+    except Exception:
+        is_cart = False
+    return f"detail={is_detail},share={is_share},cart={is_cart}"
+
+
+def _popup_fingerprint(
+    xml_str: str,
+    screen_w: int,
+    screen_h: int,
+    *,
+    max_items: int = 8,
+) -> str:
+    """提取页面/弹窗特征，便于日志快速检索和补规则。"""
+    if not xml_str:
+        return "xml=empty"
+    try:
+        root = ET.fromstring(xml_str)
+    except ET.ParseError:
+        return "xml=parse_error"
+
+    texts_all: List[str] = []
+    texts_center: List[str] = []
+    texts_clickable: List[str] = []
+    texts_top: List[str] = []
+
+    def _push(arr: List[str], v: str) -> None:
+        if not v:
+            return
+        v = re.sub(r"\s+", " ", v).strip()
+        if not v:
+            return
+        if len(v) > 24:
+            v = v[:24] + "..."
+        if v in arr:
+            return
+        arr.append(v)
+
+    cx_min, cx_max = int(screen_w * 0.2), int(screen_w * 0.8)
+    cy_min, cy_max = int(screen_h * 0.2), int(screen_h * 0.8)
+    top_max_y = int(screen_h * 0.2)
+    for n in root.iter():
+        txt = (n.get("text") or n.get("content-desc") or "").strip()
+        if not txt:
+            continue
+        b = _parse_bounds(n.get("bounds") or "")
+        if not b or len(b) < 4:
+            continue
+        x1, y1, x2, y2 = b
+        ncx, ncy = (x1 + x2) // 2, (y1 + y2) // 2
+        _push(texts_all, txt)
+        if (n.get("clickable") or "").strip() == "true":
+            _push(texts_clickable, txt)
+        if cx_min <= ncx <= cx_max and cy_min <= ncy <= cy_max:
+            _push(texts_center, txt)
+        if y1 <= top_max_y:
+            _push(texts_top, txt)
+        if (
+            len(texts_all) >= max_items
+            and len(texts_clickable) >= max_items
+            and len(texts_center) >= max_items
+            and len(texts_top) >= max_items
+        ):
+            break
+    flags = _debug_page_flags(xml_str, screen_h)
+    return (
+        f"{flags}, "
+        f"top={texts_top[:max_items]}, "
+        f"center={texts_center[:max_items]}, "
+        f"clickable={texts_clickable[:max_items]}, "
+        f"any={texts_all[:max_items]}"
+    )
+
+
+def _log_popup_fingerprint(stage: str, xml_str: str, screen_w: int, screen_h: int) -> None:
+    """统一输出页面/弹窗指纹日志。"""
+    fp = _popup_fingerprint(xml_str, screen_w, screen_h)
+    _log(f"popup_fingerprint: stage={stage}, {fp}")
 
 
 def _collect_runtime_snapshot(
@@ -1557,6 +1690,7 @@ def _wait_until_cart_layer_ready(
     点击右下购买入口后，轮询确认是否真的进入购物车/规格层。
     若识别到干扰弹窗会先尝试关闭后继续检测。
     """
+    last_xml = ""
     for i in range(max_tries):
         _dismiss_intrusive_popups_if_present(u, screen_w, screen_h, max_tries=1)
         u.dump()
@@ -1566,6 +1700,7 @@ def _wait_until_cart_layer_ready(
             time.sleep(sleep_s)
             continue
         xml_str = (out.get("result") or {}).get("xml") or ""
+        last_xml = xml_str
         is_cart = _is_cart_layer_xml(xml_str)
         is_detail = _is_product_detail_page_xml(xml_str, screen_h)
         _log(
@@ -1575,6 +1710,8 @@ def _wait_until_cart_layer_ready(
         if is_cart:
             return True
         time.sleep(sleep_s)
+    if last_xml:
+        _log_popup_fingerprint("open_cart_postcheck_failed", last_xml, screen_w, screen_h)
     return False
 
 
@@ -1718,13 +1855,21 @@ def _dismiss_intrusive_popup(u: Any, screen_w: int, screen_h: int) -> bool:
     xml_str = (out.get("result") or {}).get("xml") or ""
     if not _is_intrusive_popup(xml_str):
         return False
+    _log_popup_fingerprint("intrusive_popup_detected", xml_str, screen_w, screen_h)
     target = _find_popup_dismiss_target(xml_str, screen_w, screen_h)
     if target:
         _log("运行中弹窗: 检测到干扰弹窗，点击关闭")
         u.click(x=target[0], y=target[1])
         time.sleep(0.6)
+        u.dump()
+        out_after = u.last_result
+        if out_after.get("ok"):
+            xml_after = (out_after.get("result") or {}).get("xml") or ""
+            if _is_intrusive_popup(xml_after):
+                _log_popup_fingerprint("intrusive_popup_still_present_after_click", xml_after, screen_w, screen_h)
         return True
     _log("运行中弹窗: 检测到干扰弹窗但未找到关闭按钮，尝试 back")
+    _log_popup_fingerprint("intrusive_popup_no_target", xml_str, screen_w, screen_h)
     u.press("back")
     time.sleep(0.5)
     return True
@@ -2046,12 +2191,23 @@ def _enrich_cart_remark_for_products(
     screen_w: int,
     screen_h: int,
     max_cart_scrolls: int = 2,
+    heartbeat_hook: Optional[Callable[[Dict[str, Any]], None]] = None,
 ) -> None:
     """
     仅对给定的商品列表逐个进购物车取备注；每关闭弹窗只 press back 一次，避免退出上级页。
     """
 
-    for p in products:
+    total_products = len(products)
+    for idx, p in enumerate(products):
+        if heartbeat_hook is not None:
+            try:
+                heartbeat_hook({
+                    "stage": "cart_enrich_product",
+                    "product_index": idx + 1,
+                    "product_total": total_products,
+                })
+            except Exception:
+                pass
         title_short = (p.get("title_short") or p.get("title") or "").strip()[:30]
         u.dump()
         out = u.last_result
@@ -2587,11 +2743,13 @@ def _click_share_and_copy_link_pdd(u: Any, screen_w: int, screen_h: int) -> str:
     time.sleep(0.8)
     # 点击后验收：若分享面板未拉起，自动重试（同点位 + 轻微偏移 + 回退点）
     panel_open = False
+    last_share_check_xml = ""
     for retry_idx in range(4):
         u.dump()
         out = u.last_result
         if out.get("ok"):
             xml_now = (out.get("result") or {}).get("xml") or ""
+            last_share_check_xml = xml_now
             panel_open_now = _is_share_panel_open_xml(xml_now, screen_h)
             _log(f"click_debug: stage=share_panel_check, retry_idx={retry_idx}, open={panel_open_now}")
             if panel_open_now:
@@ -2608,6 +2766,8 @@ def _click_share_and_copy_link_pdd(u: Any, screen_w: int, screen_h: int) -> str:
         time.sleep(0.7)
     if not panel_open:
         _log("banya_hotspots: 点击分享后未拉起分享面板，返回空链接")
+        if last_share_check_xml:
+            _log_popup_fingerprint("share_panel_not_open", last_share_check_xml, screen_w, screen_h)
         return ""
     # 浮层中找「复制链接」，可能需右滑
     for swipe_attempt in range(3):
@@ -2938,16 +3098,30 @@ def _enrich_products_via_detail_flow(
     screen_w: int,
     screen_h: int,
     max_cart_scrolls: int = 2,
+    heartbeat_hook: Optional[Callable[[Dict[str, Any]], None]] = None,
 ) -> None:
     """
     对当前屏新增商品逐个执行详情流程：
     1) 点击商品进详情；2) 分享并复制链接；3) 点右下角进购物车/规格区；
     4) 解析「最后X件」明细写入备注；最后返回商品列表页。
     """
-    for p in products:
+    total_products = len(products)
+    for idx, p in enumerate(products):
+        product_t0 = time.monotonic()
+        if heartbeat_hook is not None:
+            try:
+                heartbeat_hook({
+                    "stage": "detail_enrich_product",
+                    "product_index": idx + 1,
+                    "product_total": total_products,
+                })
+            except Exception:
+                pass
+        _log(f"详情流程: product_begin idx={idx + 1}/{total_products}")
         if not _ensure_on_product_list_page(u, screen_w, screen_h):
             _log("详情流程: 未能回到商品列表页，跳过当前商品")
             continue
+        _log(f"详情流程: pre_open_state idx={idx + 1}/{total_products}")
         center = _find_product_center_on_current_screen(u, p, screen_h)
         if not center:
             _log("详情流程: 当前不在商品列表页或未匹配到商品中心，跳过")
@@ -2962,31 +3136,55 @@ def _enrich_products_via_detail_flow(
             extra=f"price={p.get('price')!r}",
         )
         _log(f"详情流程: 打开商品 {title_short!r}")
+        click_open_t0 = time.monotonic()
         u.click(x=center[0], y=center[1])
         time.sleep(1.2)
+        _log(f"详情流程: open_product_click_ms={int((time.monotonic() - click_open_t0) * 1000)}")
         _dismiss_intrusive_popups_if_present(u, screen_w, screen_h)
+        dump_state_t0 = time.monotonic()
+        u.dump()
+        out_state = u.last_result
+        xml_state = ((out_state.get("result") or {}).get("xml") or "") if out_state.get("ok") else ""
+        _log(
+            "详情流程: after_open_state "
+            f"idx={idx + 1}/{total_products}, { _debug_page_flags(xml_state, screen_h) }, "
+            f"pkg={_current_package_name(u)!r}, dump_ms={int((time.monotonic() - dump_state_t0) * 1000)}"
+        )
 
+        share_t0 = time.monotonic()
         link = _click_share_and_copy_link_pdd(u, screen_w, screen_h)
+        _log(f"详情流程: share_copy_ms={int((time.monotonic() - share_t0) * 1000)}")
         p["link"] = link or ""
         if link:
             _log(f"详情流程: 已复制链接，长度={len(link)}")
+        else:
+            _log("详情流程: 未复制到链接（link empty）")
         _dismiss_share_panel_if_present(u, screen_h)
         _dismiss_intrusive_popups_if_present(u, screen_w, screen_h)
 
         remark = ""
+        open_cart_t0 = time.monotonic()
         if _open_cart_from_detail(u, screen_w, screen_h):
+            _log(f"详情流程: open_cart_ms={int((time.monotonic() - open_cart_t0) * 1000)}")
+            remark_t0 = time.monotonic()
             remark = _collect_cart_remark_with_scroll(u, screen_w, screen_h, max_scrolls=max_cart_scrolls)
+            _log(
+                "详情流程: collect_remark_ms="
+                f"{int((time.monotonic() - remark_t0) * 1000)}, remark_len={len(remark or '')}"
+            )
             if remark:
                 _log(f"详情流程: 缺货明细 {remark[:60]!r}")
             # 仅在确认处于购物车/规格层时关闭，避免误退上级页面
             _close_cart_popup(u, screen_w, screen_h)
             time.sleep(0.5)
         else:
+            _log(f"详情流程: open_cart_ms={int((time.monotonic() - open_cart_t0) * 1000)}")
             _log("详情流程: open_cart_postcheck_failed，跳过备注采集")
         p["备注"] = remark or ""
         p["即将缺货明细"] = _parse_shortage_items_from_remark(p["备注"])
 
         # 返回商品列表页
+        back_t0 = time.monotonic()
         u.dump()
         out_after = u.last_result
         xml_after = ((out_after.get("result") or {}).get("xml") or "") if out_after.get("ok") else ""
@@ -2996,6 +3194,11 @@ def _enrich_products_via_detail_flow(
         else:
             _log("详情流程: skip_back_from_detail，reason=not_on_detail_page")
         _ensure_on_product_list_page(u, screen_w, screen_h)
+        _log(
+            "详情流程: product_done "
+            f"idx={idx + 1}/{total_products}, back_and_recover_ms={int((time.monotonic() - back_t0) * 1000)}, "
+            f"total_ms={int((time.monotonic() - product_t0) * 1000)}"
+        )
 
 
 def _bounds_contain(outer: Optional[Tuple[int, int, int, int]], inner: Optional[Tuple[int, int, int, int]]) -> bool:
@@ -3954,6 +4157,7 @@ def dump_stores_to_csv(
     no_progress_timeout_s: int = 240,
     same_store_retries: int = 2,
     timed_checkpoint_interval_s: int = 120,
+    hard_stuck_timeout_s: int = 600,
 ) -> dict:
     """
     依次对多个店铺执行 dump_store_page，将各店 rows 合并后写入一个 CSV。
@@ -3964,39 +4168,96 @@ def dump_stores_to_csv(
     all_rows: List[Dict[str, Any]] = []
     success_stores: List[str] = []
     failed_stores: List[Dict[str, Any]] = []  # [{"store": kw, "error": ..., "detail": ...}, ...]
+    state_lock = threading.Lock()
+    io_lock = threading.Lock()
+    watchdog_stop = threading.Event()
+    watchdog_hard_stuck = threading.Event()
+    last_heartbeat_ts = time.monotonic()
+    last_timed_checkpoint_ts = time.monotonic()
+    current_index = -1
+    current_store = ""
+    current_note = "init"
+
+    def _snapshot_state() -> Dict[str, Any]:
+        with state_lock:
+            return {
+                "current_index": current_index,
+                "current_store": current_store,
+                "success_stores": list(success_stores),
+                "failed_stores": [dict(x) for x in failed_stores],
+                "total_rows": len(all_rows),
+                "rows_copy": list(all_rows),
+                "note": current_note,
+                "last_heartbeat_ts": last_heartbeat_ts,
+            }
+
+    def _touch(note: str, *, idx: Optional[int] = None, store_name: Optional[str] = None) -> None:
+        nonlocal last_heartbeat_ts, current_index, current_store, current_note
+        with state_lock:
+            last_heartbeat_ts = time.monotonic()
+            current_note = note
+            if idx is not None:
+                current_index = idx
+            if store_name is not None:
+                current_store = store_name
+
+    def _write_checkpoint_from_snapshot(state: str, note: str) -> None:
+        snap = _snapshot_state()
+        with io_lock:
+            if snap["rows_copy"]:
+                write_store_csv(snap["rows_copy"], output_csv)
+            _save_dump_stores_checkpoint(
+                output_csv=output_csv,
+                current_index=snap["current_index"],
+                current_store=snap["current_store"],
+                success_stores=snap["success_stores"],
+                failed_stores=snap["failed_stores"],
+                total_rows=snap["total_rows"],
+                state=state,
+                note=note,
+            )
+
+    def _watchdog_loop() -> None:
+        nonlocal last_timed_checkpoint_ts
+        hard_reported = False
+        last_warn_bucket = -1
+        warn_interval_s = 60
+        while not watchdog_stop.wait(5.0):
+            now = time.monotonic()
+            snap = _snapshot_state()
+            interval = max(0, int(timed_checkpoint_interval_s))
+            if interval > 0 and now - last_timed_checkpoint_ts >= interval:
+                _write_checkpoint_from_snapshot("running", f"watchdog_timed:{snap['note']}")
+                last_timed_checkpoint_ts = now
+            hard_timeout = max(0, int(hard_stuck_timeout_s))
+            idle_s = int(now - snap["last_heartbeat_ts"])
+            if hard_timeout > 0:
+                warn_bucket = idle_s // max(warn_interval_s, 1)
+                if warn_bucket > last_warn_bucket and idle_s >= warn_interval_s and not hard_reported:
+                    last_warn_bucket = warn_bucket
+                    _log(
+                        "watchdog: idle_warning "
+                        f"idle={idle_s}s, hard_timeout={hard_timeout}s, "
+                        f"store={snap['current_store']!r}, index={snap['current_index']}, note={snap['note']}"
+                    )
+            if hard_timeout > 0 and idle_s >= hard_timeout and not hard_reported:
+                _log(
+                    "watchdog: 检测到主流程长时间无心跳，"
+                    f"idle={idle_s}s >= hard_stuck_timeout={hard_timeout}s, "
+                    f"store={snap['current_store']!r}, note={snap['note']}"
+                )
+                _write_checkpoint_from_snapshot("running", f"hard_stuck_detected:{idle_s}s:{snap['note']}")
+                watchdog_hard_stuck.set()
+                hard_reported = True
+
     # 默认先重启 app，从干净首页开始，避免残留页面导致搜索框/tab 解析失败
     _log("dump_stores_to_csv: 重启拼多多，从首页开始...")
     open_app(stop=True)
     time.sleep(1.2)
-    last_timed_checkpoint_ts = time.monotonic()
+    _touch("after_initial_open", idx=-1, store_name="")
+    watchdog_thread = threading.Thread(target=_watchdog_loop, name="pdd-checkpoint-watchdog", daemon=True)
+    watchdog_thread.start()
 
-    def _maybe_timed_checkpoint(
-        *,
-        current_index: int,
-        current_store: str,
-        force: bool = False,
-        note: str = "timed",
-    ) -> None:
-        nonlocal last_timed_checkpoint_ts
-        interval = max(0, int(timed_checkpoint_interval_s))
-        if not force:
-            if interval <= 0:
-                return
-            if time.monotonic() - last_timed_checkpoint_ts < interval:
-                return
-        if all_rows:
-            write_store_csv(all_rows, output_csv)
-        _save_dump_stores_checkpoint(
-            output_csv=output_csv,
-            current_index=current_index,
-            current_store=current_store,
-            success_stores=success_stores,
-            failed_stores=failed_stores,
-            total_rows=len(all_rows),
-            state="running",
-            note=note,
-        )
-        last_timed_checkpoint_ts = time.monotonic()
     retryable_errors = {
         "tab_not_found",
         "target_tab_not_found",
@@ -4004,154 +4265,146 @@ def dump_stores_to_csv(
         "no_xml",
         "stuck_no_progress",
     }
-    for i, kw in enumerate(store_keywords):
-        kw = (kw or "").strip()
-        if not kw:
-            continue
-        # 从第二家店铺起：先重启 app 回到首页，再搜下一家，否则当前仍在上一家店铺内无法进入搜索
-        if i > 0:
-            _log("dump_stores_to_csv: 返回首页以搜索下一店铺（重启拼多多）...")
-            open_app(stop=True)
-            time.sleep(3.2)
-        _log(f"dump_stores_to_csv: 处理店铺 {kw!r} ({len(success_stores) + len(failed_stores) + 1}/{len(store_keywords)})")
-        out: Dict[str, Any] = {"ok": False, "error": "unknown", "detail": ""}
-        total_attempts = max(0, int(same_store_retries)) + 1
-        for attempt in range(total_attempts):
-            _maybe_timed_checkpoint(
-                current_index=i,
-                current_store=kw,
-                note=f"timed_before_attempt:{attempt + 1}",
-            )
-            if attempt > 0:
-                _log(f"dump_stores_to_csv: 店铺 {kw!r} 第 {attempt + 1}/{total_attempts} 次重试，先重启拼多多...")
-                open_app(stop=True)
-                time.sleep(1.5)
-            try:
-                out = dump_store_page(
-                    store_keyword=kw,
-                    max_products_to_try=max_products_to_try,
-                    store_scroll_no_new_limit=store_scroll_no_new_limit,
-                    end_marker=end_marker,
-                    output_csv=None,
-                    no_dedup=no_dedup,
-                    use_detail_flow=True,
-                    max_scrolls=2,
-                    max_products_scrolls=None,
-                    no_progress_timeout_s=no_progress_timeout_s,
-                    heartbeat_hook=lambda info, _i=i, _kw=kw: _maybe_timed_checkpoint(
-                        current_index=_i,
-                        current_store=_kw,
-                        note=(
-                            "timed_heartbeat:"
-                            f"round={info.get('round_no')},idle={info.get('idle_s')},"
-                            f"total={info.get('total_now')}"
-                        ),
-                    ),
-                )
-            except Exception as e:
-                out = {
-                    "ok": False,
-                    "error": type(e).__name__,
-                    "detail": str(e),
-                }
-            if out.get("ok"):
+    aborted = False
+    abort_detail = ""
+    try:
+        for i, kw in enumerate(store_keywords):
+            if watchdog_hard_stuck.is_set():
+                aborted = True
+                abort_detail = "watchdog 检测到主流程无心跳，提前终止后续店铺"
                 break
-            err_code = out.get("error", "unknown")
-            err_detail = out.get("detail", "")
-            if err_code in retryable_errors and attempt < total_attempts - 1:
-                _log(
-                    f"dump_stores_to_csv: 店铺 {kw!r} 第 {attempt + 1}/{total_attempts} 次失败（可重试）: "
-                    f"{err_code} {err_detail}"
-                )
-                _save_dump_stores_checkpoint(
-                    output_csv=output_csv,
-                    current_index=i,
-                    current_store=kw,
-                    success_stores=success_stores,
-                    failed_stores=failed_stores,
-                    total_rows=len(all_rows),
-                    state="running",
-                    note=f"store_retry_pending:{err_code}:attempt={attempt + 1}",
-                )
+            kw = (kw or "").strip()
+            if not kw:
                 continue
-            break
-        if out.get("ok"):
-            rows = (out.get("result") or {}).get("rows") or []
-            all_rows.extend(rows)
-            success_stores.append(kw)
-            _log(f"dump_stores_to_csv: 店铺 {kw!r} 成功，rows={len(rows)}，累计 {len(all_rows)} 行")
-            if all_rows:
-                write_store_csv(all_rows, output_csv)
-            _save_dump_stores_checkpoint(
-                output_csv=output_csv,
-                current_index=i,
-                current_store=kw,
-                success_stores=success_stores,
-                failed_stores=failed_stores,
-                total_rows=len(all_rows),
-                state="running",
-                note="store_success",
-            )
-        else:
-            err_code = out.get("error", "unknown")
-            err_detail = out.get("detail", "")
-            failed_stores.append({
-                "store": kw,
-                "error": err_code,
-                "detail": err_detail,
-            })
-            _log(f"dump_stores_to_csv: 店铺 {kw!r} 失败，跳过: {err_code} {err_detail}")
-            # 失败也先落盘，避免中途崩溃丢已完成结果
-            if all_rows:
-                write_store_csv(all_rows, output_csv)
-            _save_dump_stores_checkpoint(
-                output_csv=output_csv,
-                current_index=i,
-                current_store=kw,
-                success_stores=success_stores,
-                failed_stores=failed_stores,
-                total_rows=len(all_rows),
-                state="running",
-                note=f"store_failed:{err_code}",
-            )
-            if err_code in ("no_search_elements", "tab_not_found", "stuck_no_progress"):
-                _log("dump_stores_to_csv: 搜索/进度异常，重启拼多多以便下一店铺继续")
+            _touch("store_loop_start", idx=i, store_name=kw)
+            # 从第二家店铺起：先重启 app 回到首页，再搜下一家，否则当前仍在上一家店铺内无法进入搜索
+            if i > 0:
+                _log("dump_stores_to_csv: 返回首页以搜索下一店铺（重启拼多多）...")
                 open_app(stop=True)
-                time.sleep(1.2)
-    if all_rows:
-        _log(f"dump_stores_to_csv: 写入汇总 CSV {output_csv}，共 {len(all_rows)} 行")
-        write_store_csv(all_rows, output_csv)
-        _save_dump_stores_checkpoint(
-            output_csv=output_csv,
-            current_index=len(store_keywords) - 1 if store_keywords else -1,
-            current_store="",
-            success_stores=success_stores,
-            failed_stores=failed_stores,
-            total_rows=len(all_rows),
-            state="completed",
-            note="all_done",
-        )
-    else:
-        _log("dump_stores_to_csv: 无成功店铺数据，不写入表格")
-        _save_dump_stores_checkpoint(
-            output_csv=output_csv,
-            current_index=len(store_keywords) - 1 if store_keywords else -1,
-            current_store="",
-            success_stores=success_stores,
-            failed_stores=failed_stores,
-            total_rows=0,
-            state="completed",
-            note="no_rows",
-        )
-    return {
-        "ok": True,
-        "result": {
-            "success_stores": success_stores,
-            "failed_stores": failed_stores,
-            "total_rows": len(all_rows),
-            "output_csv": output_csv if all_rows else None,
-        },
-    }
+                time.sleep(3.2)
+                _touch("after_store_switch_reopen", idx=i, store_name=kw)
+            _log(f"dump_stores_to_csv: 处理店铺 {kw!r} ({len(success_stores) + len(failed_stores) + 1}/{len(store_keywords)})")
+            out: Dict[str, Any] = {"ok": False, "error": "unknown", "detail": ""}
+            total_attempts = max(0, int(same_store_retries)) + 1
+            for attempt in range(total_attempts):
+                if watchdog_hard_stuck.is_set():
+                    aborted = True
+                    abort_detail = f"watchdog 在店铺 {kw!r} 第 {attempt + 1} 次尝试前触发"
+                    break
+                _touch(f"store_attempt_start:{attempt + 1}", idx=i, store_name=kw)
+                if attempt > 0:
+                    _log(f"dump_stores_to_csv: 店铺 {kw!r} 第 {attempt + 1}/{total_attempts} 次重试，先重启拼多多...")
+                    open_app(stop=True)
+                    time.sleep(1.5)
+                    _touch(f"store_attempt_reopen:{attempt + 1}", idx=i, store_name=kw)
+                try:
+                    out = dump_store_page(
+                        store_keyword=kw,
+                        max_products_to_try=max_products_to_try,
+                        store_scroll_no_new_limit=store_scroll_no_new_limit,
+                        end_marker=end_marker,
+                        output_csv=None,
+                        no_dedup=no_dedup,
+                        use_detail_flow=True,
+                        max_scrolls=2,
+                        max_products_scrolls=None,
+                        no_progress_timeout_s=no_progress_timeout_s,
+                        heartbeat_hook=lambda info, _i=i, _kw=kw: _touch(
+                            (
+                                "scroll_heartbeat:"
+                                f"stage={info.get('stage')},"
+                                f"round={info.get('round_no')},idle={info.get('idle_s')},"
+                                f"total={info.get('total_now')},"
+                                f"idx={info.get('product_index')}/{info.get('product_total')}"
+                            ),
+                            idx=_i,
+                            store_name=_kw,
+                        ),
+                    )
+                except Exception as e:
+                    out = {
+                        "ok": False,
+                        "error": type(e).__name__,
+                        "detail": str(e),
+                    }
+                _touch(f"store_attempt_done:{attempt + 1}", idx=i, store_name=kw)
+                if out.get("ok"):
+                    break
+                err_code = out.get("error", "unknown")
+                err_detail = out.get("detail", "")
+                if err_code in retryable_errors and attempt < total_attempts - 1:
+                    _log(
+                        f"dump_stores_to_csv: 店铺 {kw!r} 第 {attempt + 1}/{total_attempts} 次失败（可重试）: "
+                        f"{err_code} {err_detail}"
+                    )
+                    _write_checkpoint_from_snapshot(
+                        "running",
+                        f"store_retry_pending:{err_code}:attempt={attempt + 1}",
+                    )
+                    continue
+                break
+            if aborted:
+                break
+            if out.get("ok"):
+                rows = (out.get("result") or {}).get("rows") or []
+                with state_lock:
+                    all_rows.extend(rows)
+                    success_stores.append(kw)
+                _touch("store_success", idx=i, store_name=kw)
+                _log(f"dump_stores_to_csv: 店铺 {kw!r} 成功，rows={len(rows)}，累计 {len(all_rows)} 行")
+                _write_checkpoint_from_snapshot("running", "store_success")
+            else:
+                err_code = out.get("error", "unknown")
+                err_detail = out.get("detail", "")
+                with state_lock:
+                    failed_stores.append({
+                        "store": kw,
+                        "error": err_code,
+                        "detail": err_detail,
+                    })
+                _touch(f"store_failed:{err_code}", idx=i, store_name=kw)
+                _log(f"dump_stores_to_csv: 店铺 {kw!r} 失败，跳过: {err_code} {err_detail}")
+                _write_checkpoint_from_snapshot("running", f"store_failed:{err_code}")
+                if err_code in ("no_search_elements", "tab_not_found", "stuck_no_progress"):
+                    _log("dump_stores_to_csv: 搜索/进度异常，重启拼多多以便下一店铺继续")
+                    open_app(stop=True)
+                    time.sleep(1.2)
+                    _touch(f"after_store_failed_reopen:{err_code}", idx=i, store_name=kw)
+        if aborted:
+            _write_checkpoint_from_snapshot("running", f"aborted:{abort_detail or 'watchdog'}")
+            return {
+                "ok": False,
+                "error": "hard_stuck_watchdog",
+                "detail": abort_detail or "watchdog 检测到主流程长时间无心跳",
+                "result": {
+                    "success_stores": success_stores,
+                    "failed_stores": failed_stores,
+                    "total_rows": len(all_rows),
+                    "output_csv": output_csv if all_rows else None,
+                },
+            }
+        if all_rows:
+            _log(f"dump_stores_to_csv: 写入汇总 CSV {output_csv}，共 {len(all_rows)} 行")
+            write_store_csv(all_rows, output_csv)
+            _write_checkpoint_from_snapshot("completed", "all_done")
+        else:
+            _log("dump_stores_to_csv: 无成功店铺数据，不写入表格")
+            _write_checkpoint_from_snapshot("completed", "no_rows")
+        return {
+            "ok": True,
+            "result": {
+                "success_stores": success_stores,
+                "failed_stores": failed_stores,
+                "total_rows": len(all_rows),
+                "output_csv": output_csv if all_rows else None,
+            },
+        }
+    finally:
+        watchdog_stop.set()
+        try:
+            watchdog_thread.join(timeout=1.5)
+        except Exception:
+            pass
 
 
 def dump_store_page_by_product(

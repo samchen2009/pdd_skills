@@ -89,6 +89,7 @@ def main() -> int:
     p_stores.add_argument("--max-products", type=int, default=20, dest="max_products", help="单店最多点击多少个商品找进店（店铺搜索流程中未用）")
     p_stores.add_argument("--no-new-limit", type=int, default=5, dest="no_new_limit", help="店内滑到底：连续几次无新内容则停")
     p_stores.add_argument("--no-progress-timeout", type=int, default=240, dest="no_progress_timeout", help="店内长时间无新增进度判定为卡住（秒）")
+    p_stores.add_argument("--hard-stuck-timeout", type=int, default=600, dest="hard_stuck_timeout", help="主流程无心跳超时判定（秒），触发后台watchdog中断")
     p_stores.add_argument("--same-store-retries", type=int, default=2, dest="same_store_retries", help="同一家店失败后自动重试次数（默认2）")
     p_stores.add_argument("--timed-checkpoint-interval", type=int, default=120, dest="timed_checkpoint_interval", help="定时 checkpoint 间隔（秒，0表示关闭）")
     p_click = sub.add_parser("get-product-click-targets", help="从当前页解析可点击商品位置（用于进详情）")
@@ -163,6 +164,7 @@ def main() -> int:
                 max_products_to_try=getattr(args, "max_products", 20),
                 store_scroll_no_new_limit=getattr(args, "no_new_limit", 5),
                 no_progress_timeout_s=getattr(args, "no_progress_timeout", 240),
+                hard_stuck_timeout_s=getattr(args, "hard_stuck_timeout", 600),
                 same_store_retries=getattr(args, "same_store_retries", 2),
                 timed_checkpoint_interval_s=getattr(args, "timed_checkpoint_interval", 120),
             )
