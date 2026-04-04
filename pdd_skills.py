@@ -8,6 +8,7 @@ pdd_skills：拼多多定制能力（PDDAgent 继承 MobileAgent）。
 """
 
 import csv
+import html
 import io
 import json
 import re
@@ -1481,8 +1482,8 @@ _LAST_PIECES_IN_LINE_RE = re.compile(r"最后\s*\d+\s*件")
 _ONLY_LAST_PIECES_RE = re.compile(r"^最后\s*\d+\s*件\s*$")
 
 
-# 规格区标题（型号/款式/颜色），用于定位规格列表起点（参考 cart.xml 款式、cart2 颜色）
-_CART_SECTION_HEADERS = ("型号", "款式", "颜色")
+# 规格区标题（型号/款式/颜色/色号），用于定位规格列表起点（参考 cart.xml 款式、cart2 颜色、cart1 色号）
+_CART_SECTION_HEADERS = ("型号", "款式", "颜色", "色号")
 
 
 def _is_invalid_spec_name(name: str) -> bool:
@@ -1509,6 +1510,265 @@ def _spec_name_from_view_group(node: ET.Element) -> Optional[str]:
             if t and t not in _CART_POPUP_SKIP_TEXTS and not _is_invalid_spec_name(t):
                 return t
     return None
+
+
+# 「仅剩3件」「最后17件」等，用于剩余件数；与下方按行解析备注的正则不同（此处不含命名分组）
+_CART_REMAINING_COUNT_RE = re.compile(r"仅剩\s*(\d+)|最后\s*(\d+)\s*件")
+
+
+def _normalize_cart_style_line(s: str) -> str:
+    s = html.unescape(s or "")
+    s = re.sub(r"&#10;|&#13;|\r\n|\n|\r", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def _extract_remaining_count_cart(text: str) -> Optional[int]:
+    m = _CART_REMAINING_COUNT_RE.search(text or "")
+    if not m:
+        return None
+    return int(m.group(1) or m.group(2))
+
+
+def _extract_yen_price_token(text: str) -> str:
+    """从顶部价区等文案中提取主价格（如 ¥99、¥89-109）。"""
+    if not text:
+        return ""
+    s = text.replace("￥", "¥")
+    m = re.search(r"¥\s*((?:\d+(?:\.\d+)?)(?:\s*[-–]\s*\d+(?:\.\d+)?)?)", s)
+    if not m:
+        return ""
+    return "¥" + m.group(1).replace(" ", "")
+
+
+def _extract_trailing_yen_from_spec_text(text: str) -> str:
+    """款式 desc / tv_content 中最后一个 ¥ 价格（卡片标价）。"""
+    if not text:
+        return ""
+    s = text.replace("￥", "¥")
+    ms = re.findall(r"¥\s*(\d+(?:\.\d+)?)", s)
+    if not ms:
+        return ""
+    return f"¥{ms[-1]}"
+
+
+def _strip_trailing_yen_from_name(name: str) -> str:
+    s = _normalize_cart_style_line(name)
+    s = re.sub(r"\s*¥\s*\d+(?:\.\d+)?\s*$", "", s).strip()
+    return s
+
+
+def _parse_cart_popup_tv_select_suffix(root: ET.Element, package: str) -> str:
+    for n in root.iter():
+        if n.get("package") != package:
+            continue
+        rid = n.get("resource-id") or ""
+        if "tv_select_sku" not in rid:
+            continue
+        raw = (n.get("text") or "").strip()
+        if not raw:
+            continue
+        for sep in ("已选:", "已选："):
+            if raw.startswith(sep):
+                return _normalize_cart_style_line(raw[len(sep) :])
+        if raw.startswith("已选"):
+            parts = re.split(r"[:：]", raw, maxsplit=1)
+            if len(parts) > 1:
+                return _normalize_cart_style_line(parts[1])
+    return ""
+
+
+def _cart_popup_parent_map(root: ET.Element) -> Dict[ET.Element, ET.Element]:
+    m: Dict[ET.Element, ET.Element] = {}
+    for p in root.iter():
+        for c in list(p):
+            m[c] = p
+    return m
+
+
+def _find_clickable_spec_card_for_count_node(
+    count_el: ET.Element, parent_map: Dict[ET.Element, ET.Element], package: str
+) -> Optional[ET.Element]:
+    cur: Optional[ET.Element] = count_el
+    for _ in range(48):
+        cur = parent_map.get(cur) if cur is not None else None
+        if cur is None:
+            break
+        if cur.get("package") != package:
+            continue
+        cls = cur.get("class") or ""
+        if "RecyclerView" in cls:
+            break
+        if "ViewGroup" in cls and cur.get("clickable") == "true":
+            return cur
+    return None
+
+
+def _style_display_name_from_spec_card(card: ET.Element) -> str:
+    if card is None:
+        return ""
+    desc = _normalize_cart_style_line(card.get("content-desc") or "")
+    if desc and desc not in _CART_POPUP_SKIP_TEXTS and not _ONLY_LAST_PIECES_RE.match(desc):
+        return _strip_trailing_yen_from_name(desc)
+    spec = _spec_name_from_view_group(card)
+    if spec:
+        return _strip_trailing_yen_from_name(spec)
+    for c in card:
+        cls_c = c.get("class") or ""
+        if "TextView" not in cls_c:
+            continue
+        tx = (c.get("text") or "").strip()
+        if not tx or _CART_REMAINING_COUNT_RE.search(tx):
+            continue
+        if tx in _CART_POPUP_SKIP_TEXTS:
+            continue
+        if "¥" in tx or "￥" in tx:
+            continue
+        if "已选" in tx:
+            continue
+        if _is_invalid_spec_name(tx):
+            continue
+        return _strip_trailing_yen_from_name(tx)
+    for c in card.iter():
+        cls_c = c.get("class") or ""
+        if "TextView" not in cls_c:
+            continue
+        if "tv_content" not in (c.get("resource-id") or ""):
+            continue
+        tx = (c.get("text") or "").strip()
+        if tx:
+            return _strip_trailing_yen_from_name(tx)
+    return ""
+
+
+def _spec_card_explicitly_selected(card: ET.Element) -> bool:
+    if card is None:
+        return False
+    if card.get("selected") == "true":
+        return True
+    for n in card.iter():
+        if n.get("selected") == "true":
+            return True
+    return False
+
+
+def _compact_sku_key(s: str) -> str:
+    return re.sub(r"\s+", "", (s or ""))
+
+
+def _tv_select_matches_style(tv_suffix: str, style_name: str) -> bool:
+    a = _compact_sku_key(tv_suffix).lstrip("#")
+    b = _compact_sku_key(style_name).lstrip("#")
+    if not a or not b:
+        return False
+    return a in b or b in a
+
+
+def _selected_price_for_row(card: ET.Element, tv_suffix: str, style_name: str, top_price: str) -> str:
+    if _spec_card_explicitly_selected(card) or _tv_select_matches_style(tv_suffix, style_name):
+        return top_price
+    desc_full = _normalize_cart_style_line(card.get("content-desc") or "")
+    inline = _extract_trailing_yen_from_spec_text(desc_full)
+    if inline:
+        return inline
+    for dm in card.iter():
+        if "tv_content" not in (dm.get("resource-id") or ""):
+            continue
+        inline = _extract_trailing_yen_from_spec_text(dm.get("text") or "")
+        if inline:
+            return inline
+    return ""
+
+
+def _parse_cart_popup_top_header_price(root: ET.Element, package: str, section_y: Optional[int]) -> str:
+    candidates: List[Tuple[int, str]] = []
+    for n in root.iter():
+        if n.get("package") != package:
+            continue
+        cls = n.get("class") or ""
+        if "TextView" not in cls:
+            continue
+        t = (n.get("text") or "").strip()
+        if not t or ("¥" not in t and "￥" not in t):
+            continue
+        if any(x in t for x in ("已选", "手动添加", "使用#", "更换支付")):
+            continue
+        b = _parse_bounds(n.get("bounds") or "")
+        if len(b) < 4:
+            continue
+        yc = (b[1] + b[3]) // 2
+        if section_y is not None and yc > section_y + 120:
+            continue
+        if yc > 2100 or yc < 250:
+            continue
+        candidates.append((yc, t))
+    if not candidates:
+        return ""
+    candidates.sort(key=lambda x: x[0])
+    return _extract_yen_price_token(candidates[0][1])
+
+
+def parse_cart_popup_shortage_items(xml_str: str) -> List[Dict[str, Any]]:
+    """
+    从加购/规格弹层 XML 解析即将缺货明细（单屏快照）。
+
+    - 即将缺货款式：优先款式卡 ViewGroup 的 content-desc（及 tv_content），无 desc 时用行内主规格 TextView；
+    - 缺货商品价格：与「已选」或 selected 命中时用顶部价区 ¥；否则用款式 desc / tv_content 中的 ¥；
+    - 剩余件数：「仅剩」后的数字；否则「最后N件」的 N。
+    """
+    out: List[Dict[str, Any]] = []
+    seen: Set[str] = set()
+    try:
+        root = ET.fromstring(xml_str)
+    except ET.ParseError:
+        return []
+    package = PDD_PACKAGE
+    section_y: Optional[int] = None
+    for n in root.iter():
+        if n.get("package") != package:
+            continue
+        tsec = (n.get("text") or "").strip()
+        if tsec not in _CART_SECTION_HEADERS:
+            continue
+        b = _parse_bounds(n.get("bounds") or "")
+        if b and len(b) >= 4:
+            section_y = (b[1] + b[3]) // 2
+            break
+    top_price = _parse_cart_popup_top_header_price(root, package, section_y)
+    tv_suffix = _parse_cart_popup_tv_select_suffix(root, package)
+    parent_map = _cart_popup_parent_map(root)
+    for n in root.iter():
+        if n.get("package") != package:
+            continue
+        t = (n.get("text") or "").strip()
+        cnt = _extract_remaining_count_cart(t)
+        if cnt is None:
+            continue
+        b = _parse_bounds(n.get("bounds") or "")
+        if len(b) < 4:
+            continue
+        yc = (b[1] + b[3]) // 2
+        if section_y is not None and yc <= section_y:
+            continue
+        if yc >= 2200:
+            continue
+        card = _find_clickable_spec_card_for_count_node(n, parent_map, package)
+        if card is None:
+            continue
+        style_name = _style_display_name_from_spec_card(card)
+        if not style_name:
+            continue
+        price = _selected_price_for_row(card, tv_suffix, style_name, top_price)
+        key = f"{style_name}|{cnt}|{b[0]}|{b[1]}"
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append({
+            "款式": style_name,
+            "件数": cnt,
+            "缺货商品价格": price,
+        })
+    return out
 
 
 def _parse_cart_popup_xml_to_last_pieces_lines(xml_str: str) -> List[str]:
@@ -1942,25 +2202,37 @@ def _collect_cart_remark_with_scroll(
     screen_h: int,
     max_scrolls: int = 2,
     max_scrolls_horizontal: int = 3,
-) -> str:
+) -> Tuple[str, List[Dict[str, Any]]]:
     """
     当前已在加购弹窗内：先 dump 解析一次；若存在可滑动的规格区 RecyclerView（款式/型号/颜色很多时需横滑或竖滑），
-    则在其内竖滑、横滑各若干次，每次 dump 解析，合并所有「最后X件」行后去重，用换行连接返回。
+    则在其内竖滑、横滑各若干次，每次 dump 解析，合并所有「最后X件」行后去重，用换行连接返回；
+    同时合并结构化即将缺货明细（款式/件数/缺货商品价格），键为 款式|件数，后者屏若补全价格会覆盖空价。
     """
     all_lines: List[str] = []
     seen: Set[str] = set()
+    item_by_key: Dict[str, Dict[str, Any]] = {}
+    order_keys: List[str] = []
 
     def add_from_xml(xml_str: str) -> None:
         for line in _parse_cart_popup_xml_to_last_pieces_lines(xml_str):
             if line and line not in seen:
                 seen.add(line)
                 all_lines.append(line)
+        for it in parse_cart_popup_shortage_items(xml_str):
+            k = f"{it.get('款式')}|{it.get('件数')}"
+            if k not in item_by_key:
+                item_by_key[k] = dict(it)
+                order_keys.append(k)
+            else:
+                cur = item_by_key[k]
+                if not (cur.get("缺货商品价格") or "").strip() and (it.get("缺货商品价格") or "").strip():
+                    cur["缺货商品价格"] = it.get("缺货商品价格") or ""
 
     u.dump()
     out = u.last_result
     if not out.get("ok"):
         _log("购物车: dump 失败，返回空备注")
-        return ""
+        return "", []
     popup_xml = (out.get("result") or {}).get("xml") or ""
     add_from_xml(popup_xml)
 
@@ -2003,7 +2275,8 @@ def _collect_cart_remark_with_scroll(
                 add_from_xml((o.get("result") or {}).get("xml") or "")
     else:
         """_log("购物车: 无规格区可滑区域或非购物车弹窗，不滑动")"""
-    return "\n".join(all_lines) if all_lines else ""
+    merged_items = [item_by_key[k] for k in order_keys]
+    return ("\n".join(all_lines) if all_lines else "", merged_items)
 
 
 def _product_seen_key(p: Dict[str, Any]) -> str:
@@ -2176,9 +2449,15 @@ def _enrich_cart_remark_on_screen(
         cy = plus_bounds[1] + 2
         u.click(x=cx, y=cy)
         time.sleep(1)
-        remark = _collect_cart_remark_with_scroll(u, screen_w, screen_h, max_scrolls=max_cart_scrolls)
+        remark, shortage_struct = _collect_cart_remark_with_scroll(
+            u, screen_w, screen_h, max_scrolls=max_cart_scrolls
+        )
         p["备注"] = remark or ""
-        p["即将缺货明细"] = _parse_shortage_items_from_remark(p["备注"])
+        p["即将缺货明细"] = (
+            shortage_struct
+            if shortage_struct
+            else _parse_shortage_items_from_remark(p["备注"])
+        )
         if remark:
             _log(f"购物车: [商品] {remark[:60]}{'...' if len(remark) > 60 else ''!r}")
         _close_cart_popup(u, screen_w, screen_h)
@@ -2281,9 +2560,15 @@ def _enrich_cart_remark_for_products(
         cy = plus_bounds[1] + 2
         u.click(x=cx, y=cy)
         time.sleep(1)
-        remark = _collect_cart_remark_with_scroll(u, screen_w, screen_h, max_scrolls=max_cart_scrolls)
+        remark, shortage_struct = _collect_cart_remark_with_scroll(
+            u, screen_w, screen_h, max_scrolls=max_cart_scrolls
+        )
         p["备注"] = remark or ""
-        p["即将缺货明细"] = _parse_shortage_items_from_remark(p["备注"])
+        p["即将缺货明细"] = (
+            shortage_struct
+            if shortage_struct
+            else _parse_shortage_items_from_remark(p["备注"])
+        )
         if remark:
             """_log(f"备注={remark[:60]}{'...' if len(remark) > 60 else ''!r}")"""
         _close_cart_popup(u, screen_w, screen_h)
@@ -3163,11 +3448,14 @@ def _enrich_products_via_detail_flow(
         _dismiss_intrusive_popups_if_present(u, screen_w, screen_h)
 
         remark = ""
+        shortage_struct: List[Dict[str, Any]] = []
         open_cart_t0 = time.monotonic()
         if _open_cart_from_detail(u, screen_w, screen_h):
             _log(f"详情流程: open_cart_ms={int((time.monotonic() - open_cart_t0) * 1000)}")
             remark_t0 = time.monotonic()
-            remark = _collect_cart_remark_with_scroll(u, screen_w, screen_h, max_scrolls=max_cart_scrolls)
+            remark, shortage_struct = _collect_cart_remark_with_scroll(
+                u, screen_w, screen_h, max_scrolls=max_cart_scrolls
+            )
             _log(
                 "详情流程: collect_remark_ms="
                 f"{int((time.monotonic() - remark_t0) * 1000)}, remark_len={len(remark or '')}"
@@ -3181,7 +3469,11 @@ def _enrich_products_via_detail_flow(
             _log(f"详情流程: open_cart_ms={int((time.monotonic() - open_cart_t0) * 1000)}")
             _log("详情流程: open_cart_postcheck_failed，跳过备注采集")
         p["备注"] = remark or ""
-        p["即将缺货明细"] = _parse_shortage_items_from_remark(p["备注"])
+        p["即将缺货明细"] = (
+            shortage_struct
+            if shortage_struct
+            else _parse_shortage_items_from_remark(p["备注"])
+        )
 
         # 返回商品列表页
         back_t0 = time.monotonic()
