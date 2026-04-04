@@ -1482,8 +1482,8 @@ _LAST_PIECES_IN_LINE_RE = re.compile(r"最后\s*\d+\s*件")
 _ONLY_LAST_PIECES_RE = re.compile(r"^最后\s*\d+\s*件\s*$")
 
 
-# 规格区标题（型号/款式/颜色/色号），用于定位规格列表起点（参考 cart.xml 款式、cart2 颜色、cart1 色号）
-_CART_SECTION_HEADERS = ("型号", "款式", "颜色", "色号")
+# 规格区标题（含净含量等），用于定位规格列表起点；须按屏内自上而下首次出现的维度设 section_y（见 mocks/cart5.xml）
+_CART_SECTION_HEADERS = ("型号", "款式", "颜色", "色号", "净含量")
 
 
 def _is_invalid_spec_name(name: str) -> bool:
@@ -1499,15 +1499,70 @@ def _is_invalid_spec_name(name: str) -> bool:
     return False
 
 
+# 规格卡/行上展示的售罄类文案，不作为款式抓取（勿与真实 SKU 名混用）
+_CART_SOLD_OUT_UI_MARKERS = (
+    "刚刚抢光",
+    "已售罄",
+    "售罄",
+    "抢光了",
+    "已抢完",
+    "暂时缺货",
+)
+
+
+def _cart_spec_looks_sold_out_display(s: str) -> bool:
+    t = (s or "").strip()
+    if not t:
+        return False
+    return any(m in t for m in _CART_SOLD_OUT_UI_MARKERS)
+
+
+def _spec_card_tv_shows_sold_out(card: ET.Element) -> bool:
+    """款式卡内 tv_content 是否为售罄类展示（如「刚刚抢光」），与 content-desc 上的真实 SKU 名区分。"""
+    for c in card.iter():
+        if "tv_content" not in (c.get("resource-id") or ""):
+            continue
+        tx = (c.get("text") or "").strip()
+        if _cart_spec_looks_sold_out_display(tx):
+            return True
+    return False
+
+
+# 横向规格列表右侧仅露一条边的卡（宽约数十 dp）：tv 可能仍是完整款名（cart6 火龙果）；左侧露边窄卡可能仍有货（cart3），须配合右缘判断
+_CART_PEEK_SPEC_CARD_MAX_WIDTH_PX = 120
+_CART_PEEK_FROM_RIGHT_MARGIN_PX = 220
+
+
+def _cart_popup_max_x2_for_package(root: ET.Element, package: str) -> int:
+    mx = 0
+    for n in root.iter():
+        if n.get("package") != package:
+            continue
+        b = _parse_bounds(n.get("bounds") or "")
+        if len(b) >= 4:
+            mx = max(mx, int(b[2]))
+    return mx if mx > 0 else 1080
+
+
 def _spec_name_from_view_group(node: ET.Element) -> Optional[str]:
     """从 ViewGroup 节点取规格名：content-desc 或子节点 tv_content 的 text。"""
     desc = (node.get("content-desc") or "").strip()
-    if desc and desc not in _CART_POPUP_SKIP_TEXTS and not _is_invalid_spec_name(desc):
+    if (
+        desc
+        and desc not in _CART_POPUP_SKIP_TEXTS
+        and not _is_invalid_spec_name(desc)
+        and not _cart_spec_looks_sold_out_display(desc)
+    ):
         return re.sub(r"\s+", " ", desc).strip()
     for c in node.iter():
         if "tv_content" in (c.get("resource-id") or ""):
             t = (c.get("text") or "").strip()
-            if t and t not in _CART_POPUP_SKIP_TEXTS and not _is_invalid_spec_name(t):
+            if (
+                t
+                and t not in _CART_POPUP_SKIP_TEXTS
+                and not _is_invalid_spec_name(t)
+                and not _cart_spec_looks_sold_out_display(t)
+            ):
                 return t
     return None
 
@@ -1604,29 +1659,51 @@ def _find_clickable_spec_card_for_count_node(
     return None
 
 
+def _is_valid_cart_style_chip_text(tx: str) -> bool:
+    """
+    规格行内主文案是否可作为「即将缺货款式」。
+    净含量类（如 500mL）在 _is_invalid_spec_name 中会被当成纯单位过滤，此处放行。
+    """
+    s = (tx or "").strip()
+    if not s:
+        return False
+    if _CART_REMAINING_COUNT_RE.search(s):
+        return False
+    if s in _CART_POPUP_SKIP_TEXTS:
+        return False
+    if _cart_spec_looks_sold_out_display(s):
+        return False
+    if "¥" in s or "￥" in s or "已选" in s:
+        return False
+    if _ONLY_LAST_PIECES_RE.match(s):
+        return False
+    if re.fullmatch(r"\d+(\.\d+)?\s*[mM][lL]?", s):
+        return True
+    if re.fullmatch(r"\d+(\.\d+)?\s*(?:[lL]|升|毫升)", s):
+        return True
+    return not _is_invalid_spec_name(s)
+
+
 def _style_display_name_from_spec_card(card: ET.Element) -> str:
     if card is None:
         return ""
     desc = _normalize_cart_style_line(card.get("content-desc") or "")
-    if desc and desc not in _CART_POPUP_SKIP_TEXTS and not _ONLY_LAST_PIECES_RE.match(desc):
+    if (
+        desc
+        and desc not in _CART_POPUP_SKIP_TEXTS
+        and not _ONLY_LAST_PIECES_RE.match(desc)
+        and not _cart_spec_looks_sold_out_display(desc)
+    ):
         return _strip_trailing_yen_from_name(desc)
     spec = _spec_name_from_view_group(card)
-    if spec:
+    if spec and not _cart_spec_looks_sold_out_display(spec):
         return _strip_trailing_yen_from_name(spec)
     for c in card:
         cls_c = c.get("class") or ""
         if "TextView" not in cls_c:
             continue
         tx = (c.get("text") or "").strip()
-        if not tx or _CART_REMAINING_COUNT_RE.search(tx):
-            continue
-        if tx in _CART_POPUP_SKIP_TEXTS:
-            continue
-        if "¥" in tx or "￥" in tx:
-            continue
-        if "已选" in tx:
-            continue
-        if _is_invalid_spec_name(tx):
+        if not _is_valid_cart_style_chip_text(tx):
             continue
         return _strip_trailing_yen_from_name(tx)
     for c in card.iter():
@@ -1636,7 +1713,7 @@ def _style_display_name_from_spec_card(card: ET.Element) -> str:
         if "tv_content" not in (c.get("resource-id") or ""):
             continue
         tx = (c.get("text") or "").strip()
-        if tx:
+        if tx and not _cart_spec_looks_sold_out_display(tx):
             return _strip_trailing_yen_from_name(tx)
     return ""
 
@@ -1714,7 +1791,7 @@ def parse_cart_popup_shortage_items(xml_str: str) -> List[Dict[str, Any]]:
 
     - 即将缺货款式：优先款式卡 ViewGroup 的 content-desc（及 tv_content），无 desc 时用行内主规格 TextView；
     - 缺货商品价格：与「已选」或 selected 命中时用顶部价区 ¥；否则用款式 desc / tv_content 中的 ¥；
-    - 剩余件数：「仅剩」后的数字；否则「最后N件」的 N。
+    - 剩余件数：「仅剩」后的数字；否则「最后N件」的 N；若 tv 为「刚刚抢光」等或无数字件数但卡为屏幕右缘露出的窄条，则件数为字符串「抢光」（款式仍取 content-desc；右缘判断避免把左侧露边仍有货卡误判为抢光，见 cart3/cart6 mocks）。
     """
     out: List[Dict[str, Any]] = []
     seen: Set[str] = set()
@@ -1756,7 +1833,7 @@ def parse_cart_popup_shortage_items(xml_str: str) -> List[Dict[str, Any]]:
         if card is None:
             continue
         style_name = _style_display_name_from_spec_card(card)
-        if not style_name:
+        if not style_name or _cart_spec_looks_sold_out_display(style_name):
             continue
         price = _selected_price_for_row(card, tv_suffix, style_name, top_price)
         key = f"{style_name}|{cnt}|{b[0]}|{b[1]}"
@@ -1766,6 +1843,96 @@ def parse_cart_popup_shortage_items(xml_str: str) -> List[Dict[str, Any]]:
         out.append({
             "款式": style_name,
             "件数": cnt,
+            "缺货商品价格": price,
+        })
+    # 无「最后N件/仅剩」数字、但 tv 为「刚刚抢光」等：仍输出缺货行（件数=抢光），款式用 content-desc（见 mocks/cart6.xml）
+    style_with_numeric_count = {it["款式"] for it in out if isinstance(it.get("件数"), int)}
+    for n in root.iter():
+        if n.get("package") != package:
+            continue
+        if (n.get("class") or "") != "android.view.ViewGroup":
+            continue
+        if n.get("clickable") != "true":
+            continue
+        desc = (n.get("content-desc") or "").strip()
+        if not desc or desc in _CART_POPUP_SKIP_TEXTS or _is_invalid_spec_name(desc):
+            continue
+        if _LAST_PIECES_IN_LINE_RE.search(desc):
+            continue
+        if _cart_spec_looks_sold_out_display(desc):
+            continue
+        b = _parse_bounds(n.get("bounds") or "")
+        if len(b) < 4:
+            continue
+        yc = (b[1] + b[3]) // 2
+        if section_y is not None and yc <= section_y:
+            continue
+        if yc >= 2200:
+            continue
+        if not _spec_card_tv_shows_sold_out(n):
+            continue
+        style_name = _style_display_name_from_spec_card(n)
+        if not style_name or _cart_spec_looks_sold_out_display(style_name):
+            continue
+        if style_name in style_with_numeric_count:
+            continue
+        key = f"{style_name}|抢光|{b[0]}|{b[1]}"
+        if key in seen:
+            continue
+        seen.add(key)
+        price = _selected_price_for_row(n, tv_suffix, style_name, top_price)
+        out.append({
+            "款式": style_name,
+            "件数": "抢光",
+            "缺货商品价格": price,
+        })
+    # 右侧露边窄卡：无数字件数、tv 未写抢光时仍视为抢光（与暖蜜瓜同列仅露边的火龙果，见 mocks/cart6.xml）
+    max_x2 = _cart_popup_max_x2_for_package(root, package)
+    right_peek_x0_min = max_x2 - _CART_PEEK_FROM_RIGHT_MARGIN_PX
+    styles_already = {it["款式"] for it in out}
+    for n in root.iter():
+        if n.get("package") != package:
+            continue
+        if (n.get("class") or "") != "android.view.ViewGroup":
+            continue
+        if n.get("clickable") != "true":
+            continue
+        desc = (n.get("content-desc") or "").strip()
+        if not desc or desc in _CART_POPUP_SKIP_TEXTS or _is_invalid_spec_name(desc):
+            continue
+        if _LAST_PIECES_IN_LINE_RE.search(desc):
+            continue
+        if _cart_spec_looks_sold_out_display(desc):
+            continue
+        b = _parse_bounds(n.get("bounds") or "")
+        if len(b) < 4:
+            continue
+        card_w = int(b[2]) - int(b[0])
+        if card_w >= _CART_PEEK_SPEC_CARD_MAX_WIDTH_PX:
+            continue
+        if int(b[0]) < right_peek_x0_min:
+            continue
+        yc = (b[1] + b[3]) // 2
+        if section_y is not None and yc <= section_y:
+            continue
+        if yc >= 2200:
+            continue
+        style_name = _style_display_name_from_spec_card(n)
+        if not style_name or _cart_spec_looks_sold_out_display(style_name):
+            continue
+        if style_name in style_with_numeric_count:
+            continue
+        if style_name in styles_already:
+            continue
+        key = f"{style_name}|抢光|peek_r|{b[0]}|{b[1]}"
+        if key in seen:
+            continue
+        seen.add(key)
+        styles_already.add(style_name)
+        price = _selected_price_for_row(n, tv_suffix, style_name, top_price)
+        out.append({
+            "款式": style_name,
+            "件数": "抢光",
             "缺货商品价格": price,
         })
     return out
@@ -1824,7 +1991,7 @@ def _parse_cart_popup_xml_to_last_pieces_lines(xml_str: str) -> List[str]:
             if not bcur or len(bcur) < 4 or (section_y is not None and (bcur[1] + bcur[3]) // 2 <= section_y):
                 continue
             spec = _spec_name_from_view_group(cur)
-            if spec:
+            if spec and not _cart_spec_looks_sold_out_display(spec):
                 line = f"{spec.strip()} {text}".strip()
                 if line and line not in seen_lines:
                     seen_lines.add(line)
@@ -1876,12 +2043,15 @@ def _parse_cart_popup_xml_to_last_pieces_lines(xml_str: str) -> List[str]:
     for ln in sorted(seen_lines):
         if ln not in result and not _ONLY_LAST_PIECES_RE.match(ln):
             result.append(ln)
-    # recovery pass：按就近 y 坐标配对「最后X件」与规格 ViewGroup(content-desc)，避免丢行
+    # recovery：与 parse_cart_popup_shortage_items 一致，从件数 TextView 向上找可点击规格卡（DOM），不用坐标与其它款配对。
     if section_y is not None:
-        spec_candidates: List[Tuple[str, int]] = []  # (spec_text, y_center)
-        count_nodes: List[Tuple[str, int]] = []  # (count_text, y_center)
         for n in root.iter():
             if n.get("package") != package:
+                continue
+            if "TextView" not in (n.get("class") or ""):
+                continue
+            count_t = (n.get("text") or "").strip()
+            if not _LAST_PIECES_IN_LINE_RE.search(count_t):
                 continue
             b = _parse_bounds(n.get("bounds") or "")
             if not b or len(b) < 4:
@@ -1889,35 +2059,23 @@ def _parse_cart_popup_xml_to_last_pieces_lines(xml_str: str) -> List[str]:
             y_c = (b[1] + b[3]) // 2
             if y_c <= section_y or y_c >= bottom_cutoff:
                 continue
-            t = (n.get("text") or "").strip()
-            if _LAST_PIECES_IN_LINE_RE.search(t):
-                count_nodes.append((t, y_c))
-            if (n.get("class") or "") == "android.view.ViewGroup":
-                spec = _spec_name_from_view_group(n)
-                if spec and not _LAST_PIECES_IN_LINE_RE.search(spec):
-                    spec_candidates.append((spec, y_c))
-        used_spec_idx: Set[int] = set()
-        for count_text, cy in count_nodes:
-            best_idx = -1
-            best_dist = 10**9
-            for idx, (spec_text, sy) in enumerate(spec_candidates):
-                if idx in used_spec_idx:
-                    continue
-                dist = abs(sy - cy)
-                if dist <= 240 and dist < best_dist:
-                    best_dist = dist
-                    best_idx = idx
-            if best_idx >= 0:
-                used_spec_idx.add(best_idx)
-                spec_text = spec_candidates[best_idx][0]
-                line = re.sub(r"\s+", " ", f"{spec_text} {count_text}").strip()
-                if (
-                    line
-                    and _LAST_PIECES_IN_LINE_RE.search(line)
-                    and not _ONLY_LAST_PIECES_RE.match(line)
-                    and line not in result
-                ):
-                    result.append(line)
+            card = _find_clickable_spec_card_for_count_node(n, parent_map, package)
+            if card is None:
+                continue
+            style_name = _style_display_name_from_spec_card(card)
+            if not style_name or _cart_spec_looks_sold_out_display(style_name):
+                continue
+            line = re.sub(r"\s+", " ", f"{style_name} {count_t}").strip()
+            if (
+                line
+                and _LAST_PIECES_IN_LINE_RE.search(line)
+                and not _ONLY_LAST_PIECES_RE.match(line)
+                and not _cart_spec_looks_sold_out_display(line)
+                and line not in result
+            ):
+                result.append(line)
+    # 合并行等路径可能仍带入售罄文案，统一剔除
+    result = [ln for ln in result if not _cart_spec_looks_sold_out_display(ln)]
     return result
 
 
@@ -2684,7 +2842,8 @@ def _excel_text_display_width(text: str) -> int:
     return width
 
 
-_LAST_PIECES_IN_LINE_RE = re.compile(r"(?P<name>.*?)最后\s*(?P<count>\d+)\s*件")
+# 备注行解析用（含命名分组）；勿与弹窗检测用的 _LAST_PIECES_IN_LINE_RE 共用，避免后者被覆盖
+_LAST_PIECES_IN_REMARK_RE = re.compile(r"(?P<name>.*?)最后\s*(?P<count>\d+)\s*件")
 
 
 def _parse_shortage_items_from_remark(remark: str) -> List[Tuple[str, int, str]]:
@@ -2694,7 +2853,7 @@ def _parse_shortage_items_from_remark(remark: str) -> List[Tuple[str, int, str]]
         line = re.sub(r"\s+", " ", raw.strip())
         if not line:
             continue
-        for m in _LAST_PIECES_IN_LINE_RE.finditer(line):
+        for m in _LAST_PIECES_IN_REMARK_RE.finditer(line):
             raw_name = re.sub(r"[\s\-:：,，;；/]+$", "", (m.group("name") or "").strip()).strip()
             shortage_price = _extract_shortage_price_from_name(raw_name)
             # 规格与价格分列：规格去掉末尾价格（例如 "... ¥109"）
