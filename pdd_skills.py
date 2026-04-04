@@ -2228,7 +2228,10 @@ def _collect_cart_remark_with_scroll(
                 if not (cur.get("缺货商品价格") or "").strip() and (it.get("缺货商品价格") or "").strip():
                     cur["缺货商品价格"] = it.get("缺货商品价格") or ""
 
+    dump_t0 = time.monotonic()
     u.dump()
+    dump_ms = int((time.monotonic() - dump_t0) * 1000)
+    _log(f"购物车: 第1次 dump 耗时 {dump_ms}ms")
     out = u.last_result
     if not out.get("ok"):
         _log("购物车: dump 失败，返回空备注")
@@ -2254,7 +2257,10 @@ def _collect_cart_remark_with_scroll(
             for i in range(max_scrolls):
                 u.swipe(cx, from_y, cx, to_y, duration=0.25)
                 time.sleep(1)
+                dump_t0 = time.monotonic()
                 u.dump()
+                dump_ms = int((time.monotonic() - dump_t0) * 1000)
+                _log(f"购物车: 竖滑第{i+1}次 dump 耗时 {dump_ms}ms")
                 o = u.last_result
                 if not o.get("ok"):
                     _log("购物车: 竖滑后 dump 失败，停止竖滑")
@@ -2267,7 +2273,10 @@ def _collect_cart_remark_with_scroll(
             for i in range(max_scrolls_horizontal):
                 u.swipe(from_x, cy, to_x, cy, duration=0.25)
                 time.sleep(1)
+                dump_t0 = time.monotonic()
                 u.dump()
+                dump_ms = int((time.monotonic() - dump_t0) * 1000)
+                _log(f"购物车: 横滑第{i+1}次 dump 耗时 {dump_ms}ms")
                 o = u.last_result
                 if not o.get("ok"):
                     _log("购物车: 横滑后 dump 失败，停止横滑")
@@ -3132,7 +3141,10 @@ def _open_cart_from_detail(u: Any, screen_w: int, screen_h: int) -> bool:
     优先点击底部右侧带「购物车/加入购物车/选规格」语义的可点击节点；否则回退到右下角坐标。
     """
     _dismiss_intrusive_popups_if_present(u, screen_w, screen_h)
+    dump_t0 = time.monotonic()
     u.dump()
+    dump_ms = int((time.monotonic() - dump_t0) * 1000)
+    _log(f"购物车: _open_cart_from_detail dump 耗时 {dump_ms}ms")
     out = u.last_result
     if not out.get("ok"):
         return False
@@ -3428,13 +3440,9 @@ def _enrich_products_via_detail_flow(
         _dismiss_intrusive_popups_if_present(u, screen_w, screen_h)
         dump_state_t0 = time.monotonic()
         u.dump()
+        dump_ms = int((time.monotonic() - dump_state_t0) * 1000)
+        _log(f"详情流程: after_open_state dump 耗时 {dump_ms}ms")
         out_state = u.last_result
-        xml_state = ((out_state.get("result") or {}).get("xml") or "") if out_state.get("ok") else ""
-        _log(
-            "详情流程: after_open_state "
-            f"idx={idx + 1}/{total_products}, { _debug_page_flags(xml_state, screen_h) }, "
-            f"pkg={_current_package_name(u)!r}, dump_ms={int((time.monotonic() - dump_state_t0) * 1000)}"
-        )
 
         share_t0 = time.monotonic()
         link = _click_share_and_copy_link_pdd(u, screen_w, screen_h)
